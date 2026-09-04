@@ -33,9 +33,19 @@ def guess_delim(line: str):
     return rp[0] if not lp else lp[-1]
 
 
+# Millisecond precision matters: with whole-second timestamps a burst of requests
+# all land on the same second, tie in _order_by and stop rotating.
+LAST_USED_NOW = "strftime('%Y-%m-%d %H:%M:%f', 'now')"
+
+
 class AccountsPool:
-    # _order_by: str = "RANDOM()"
-    _order_by: str = "username"
+    # Least-recently-used first, so load spreads over the pool instead of always
+    # hitting the same account (one hot account is what gets a pool banned).
+    # last_used is stored in two shapes - SQL writes "YYYY-MM-DD HH:MM:SS.SSS",
+    # Account.to_rs() writes ISO with "T" and a "+00:00" offset - which do not
+    # compare correctly as text, so julianday() normalizes both before sorting.
+    # NULL (never used) sorts first; RANDOM() splits accounts that still tie.
+    _order_by: str = "julianday(last_used) ASC, RANDOM()"
 
     def __init__(
         self,
@@ -271,7 +281,7 @@ class AccountsPool:
         UPDATE accounts SET
             locks = json_set(locks, '$.{queue}', datetime({unlock_at}, 'unixepoch')),
             stats = json_set(stats, '$.{queue}', COALESCE(json_extract(stats, '$.{queue}'), 0) + {req_count}),
-            last_used = datetime({utc.ts()}, 'unixepoch')
+            last_used = {LAST_USED_NOW}
         WHERE username = :username
         """
         await execute(self._db_file, qs, {"username": username})
@@ -281,7 +291,7 @@ class AccountsPool:
         UPDATE accounts SET
             locks = json_remove(locks, '$.{queue}'),
             stats = json_set(stats, '$.{queue}', COALESCE(json_extract(stats, '$.{queue}'), 0) + {req_count}),
-            last_used = datetime({utc.ts()}, 'unixepoch')
+            last_used = {LAST_USED_NOW}
         WHERE username = :username
         """
         await execute(self._db_file, qs, {"username": username})
@@ -294,7 +304,7 @@ class AccountsPool:
             qs = f"""
             UPDATE accounts SET
                 locks = json_set(locks, '$.{queue}', datetime('now', '+15 minutes')),
-                last_used = datetime({utc.ts()}, 'unixepoch')
+                last_used = {LAST_USED_NOW}
             WHERE username = {condition}
             RETURNING *
             """
@@ -304,7 +314,7 @@ class AccountsPool:
             qs = f"""
             UPDATE accounts SET
                 locks = json_set(locks, '$.{queue}', datetime('now', '+15 minutes')),
-                last_used = datetime({utc.ts()}, 'unixepoch'),
+                last_used = {LAST_USED_NOW},
                 _tx = '{tx}'
             WHERE username = {condition}
             """
