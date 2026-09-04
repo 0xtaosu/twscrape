@@ -287,7 +287,7 @@ def test_following_503_reports_retry_after_and_pool_reason(pool_mock: AccountsPo
     from twscrape.dashboard import DashboardAuth, DashboardServer
 
     class ExhaustedXApi:
-        async def following(self, ident, limit, by, skip_user):
+        async def following(self, ident, limit, by, skip_user, cursor=None):
             raise NoAccountError("exhausted")
 
     server = DashboardServer(
@@ -490,6 +490,70 @@ def test_login_lockout_trusts_cf_ip_only_when_configured(pool_mock, tmp_path, tr
             login("wrong-password", "203.0.113.10")
         status = login("password123", "203.0.113.11")
         assert status == (200 if trusted_proxy else 429)
+    finally:
+        server.shutdown()
+        serve_thread.join(timeout=5)
+        server.server_close()
+
+
+def test_following_forwards_cursor_and_returns_next_cursor(pool_mock: AccountsPool, tmp_path):
+    import json
+    import threading
+    import urllib.error
+    import urllib.request
+
+    from twscrape.dashboard import DashboardAuth, DashboardServer
+
+    class PagingXApi:
+        calls: list[Any] = []
+
+        async def following(self, ident, limit, by, skip_user, cursor=None):
+            self.calls.append((ident, limit, by, skip_user, cursor))
+            return {
+                "kind": "following",
+                "user": None,
+                "users": [{"id": "7"}],
+                "count": 1,
+                "next_cursor": "page-2" if cursor is None else None,
+            }
+
+    server = DashboardServer(
+        ("127.0.0.1", 0),
+        pool_mock,
+        DashboardAuth("admin", "password123"),
+        str(tmp_path / "cursor.db"),
+    )
+    x_api = PagingXApi()
+    server.x_api = cast(Any, x_api)
+    _, api_token = server.runner.run(server.api_keys.create("cursor-client"))
+    serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    serve_thread.start()
+
+    def get(query: str):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/api/user/1/following?{query}",
+            headers={"Authorization": f"Bearer {api_token}"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as rep:
+            return json.loads(rep.read())
+
+    try:
+        first = get("by=id&skip_user=true&limit=20")
+        assert first["next_cursor"] == "page-2"
+        assert x_api.calls[-1] == ("1", 20, "id", True, None)
+
+        second = get("by=id&skip_user=true&limit=20&cursor=page-2")
+        assert second["next_cursor"] is None
+        assert x_api.calls[-1] == ("1", 20, "id", True, "page-2")
+
+        # a malformed cursor is a client error, not a 502 from upstream
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/api/user/1/following?cursor={'x' * 501}",
+            headers={"Authorization": f"Bearer {api_token}"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=10)
+        assert caught.value.code == 400
     finally:
         server.shutdown()
         serve_thread.join(timeout=5)
