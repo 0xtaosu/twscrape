@@ -393,3 +393,80 @@ async def test_load_from_file(pool_mock: AccountsPool, tmp_path):
     usernames = {x.username for x in await pool_mock.get_all()}
     assert "user1" in usernames
     assert "user2" in usernames
+
+
+async def _add_active(pool: AccountsPool, *usernames: str):
+    for x in usernames:
+        await pool.add_account(x, "pass", "email", "ep", cookies=f"auth_token=t_{x}; ct0=c_{x}")
+        await pool.set_active(x, True)
+
+
+async def test_get_for_queue_spreads_load_over_accounts(pool_mock: AccountsPool):
+    # Regression: with ORDER BY username every sequential request went to the
+    # alphabetically first account, so one account absorbed the whole workload
+    # and was the only one exposed to a ban.
+    Q = "SearchTimeline"
+    await _add_active(pool_mock, "user1", "user2", "user3", "user4", "user5")
+
+    used = []
+    for _ in range(20):
+        acc = await pool_mock.get_for_queue(Q)
+        assert acc is not None
+        used.append(acc.username)
+        await pool_mock.unlock(acc.username, Q)
+
+    assert len(set(used)) == 5, f"expected all accounts to be used, got {set(used)}"
+    counts = {x: used.count(x) for x in set(used)}
+    assert set(counts.values()) == {4}, f"expected even round-robin, got {counts}"
+
+
+async def test_get_for_queue_prefers_never_used_account(pool_mock: AccountsPool):
+    Q = "SearchTimeline"
+    await _add_active(pool_mock, "user1")
+
+    acc = await pool_mock.get_for_queue(Q)
+    assert acc is not None and acc.username == "user1"
+    await pool_mock.unlock("user1", Q)
+
+    # user2 joins the pool later and has never been used - it must go first
+    await _add_active(pool_mock, "user2")
+    acc = await pool_mock.get_for_queue(Q)
+    assert acc is not None
+    assert acc.username == "user2"
+
+
+async def test_get_for_queue_orders_mixed_last_used_formats(pool_mock: AccountsPool):
+    # Account.to_rs() (used by save/login) stores last_used as ISO with a "T"
+    # separator and a "+00:00" offset, while the lock/unlock SQL stores
+    # "YYYY-MM-DD HH:MM:SS.SSS". Sorting those as plain text puts every "T" row
+    # after every space row regardless of time, so ordering must normalize them.
+    Q = "SearchTimeline"
+    await _add_active(pool_mock, "user1", "user2")
+
+    recent = await pool_mock.get("user1")
+    recent.last_used = utc.now()
+    await pool_mock.save(recent)  # writes the ISO/"T" shape
+
+    stale = await pool_mock.get("user2")
+    stale.last_used = utc.from_iso("2020-01-01 00:00:00")
+    await pool_mock.save(stale)
+
+    acc = await pool_mock.get_for_queue(Q)
+    assert acc is not None
+    assert acc.username == "user2", "least-recently-used account should win"
+
+
+async def test_get_for_queue_skips_locked_account(pool_mock: AccountsPool):
+    Q = "SearchTimeline"
+    await _add_active(pool_mock, "user1", "user2")
+
+    first = await pool_mock.get_for_queue(Q)
+    assert first is not None
+    await pool_mock.lock_until(first.username, Q, utc.ts() + 600)
+
+    second = await pool_mock.get_for_queue(Q)
+    assert second is not None
+    assert second.username != first.username
+
+    # both are locked now -> nothing left to hand out
+    assert await pool_mock.get_for_queue(Q) is None
