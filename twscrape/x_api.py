@@ -4,7 +4,7 @@ from typing import Any, AsyncGenerator
 
 from .accounts_pool import AccountsPool
 from .api import API
-from .models import Tweet, User, parse_user
+from .models import Tweet, User, parse_user, parse_users
 
 
 class XApiNotFoundError(Exception):
@@ -65,6 +65,20 @@ def parse_uid(value: str) -> int:
     if uid <= 0:
         raise ValueError("user id must be positive")
     return uid
+
+
+def parse_cursor(value: str | None) -> str | None:
+    """Validate an opaque pagination cursor handed back by a previous response."""
+    if value is None:
+        return None
+    cursor = value.strip()
+    if not cursor:
+        return None
+    if len(cursor) > 500:
+        raise ValueError("cursor must not exceed 500 characters")
+    if any(ch.isspace() or ord(ch) < 0x20 for ch in cursor):
+        raise ValueError("cursor is malformed")
+    return cursor
 
 
 def parse_bool(value: str | None, default: bool = False, name: str = "include_replies") -> bool:
@@ -175,14 +189,27 @@ async def _collect(source: AsyncGenerator[Tweet, None], limit: int) -> list[dict
     return items
 
 
-async def _collect_users(source: AsyncGenerator[User, None], limit: int) -> list[dict[str, Any]]:
+async def _collect_user_pages(
+    source: AsyncGenerator[Any, None], limit: int, get_cursor: Any
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Collect whole upstream pages and the cursor that follows the last one.
+
+    X paginates by page, not by user: a cursor points at a page boundary. Cutting
+    a page at `limit` and then handing back that page's cursor would silently skip
+    every user between the cut and the boundary, so pages are always taken whole.
+    That means `count` can overshoot `limit` when X returns a larger page than
+    asked for - overshooting is visible to the caller, dropped users are not.
+    """
     items: list[dict[str, Any]] = []
+    next_cursor: str | None = None
     async with aclosing(source):
-        async for user in source:
-            items.append(user_to_dict(user))
-            if len(items) >= limit:
+        async for rep in source:
+            obj = rep.json()
+            items.extend(user_to_dict(x) for x in parse_users(obj))
+            next_cursor = get_cursor(obj)
+            if next_cursor is None or len(items) >= limit:
                 break
-    return items
+    return items, next_cursor
 
 
 class XApiService:
@@ -227,14 +254,24 @@ class XApiService:
         return {"user": user_to_dict(user), "tweets": tweets, "count": len(tweets)}
 
     async def followers(
-        self, ident: str, limit: int, by: str = "username", skip_user: bool = False
+        self,
+        ident: str,
+        limit: int,
+        by: str = "username",
+        skip_user: bool = False,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
-        return await self._social_graph(ident, limit, "followers", by, skip_user)
+        return await self._social_graph(ident, limit, "followers", by, skip_user, cursor)
 
     async def following(
-        self, ident: str, limit: int, by: str = "username", skip_user: bool = False
+        self,
+        ident: str,
+        limit: int,
+        by: str = "username",
+        skip_user: bool = False,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
-        return await self._social_graph(ident, limit, "following", by, skip_user)
+        return await self._social_graph(ident, limit, "following", by, skip_user, cursor)
 
     async def following_batch(
         self, ids: list[int], limit: int, skip_user: bool = True
@@ -250,6 +287,7 @@ class XApiService:
                         "ok": True,
                         "users": item["users"],
                         "count": item["count"],
+                        "next_cursor": item["next_cursor"],
                     }
                 )
             except XApiNotFoundError as error:
@@ -275,6 +313,7 @@ class XApiService:
         kind: str,
         by: str = "username",
         skip_user: bool = False,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
         # 按 id 调用时已经有 uid，skip_user 可以省掉一次 user 查询——
         # 轮询几百个账号时这一半的请求量很实在。
@@ -284,17 +323,27 @@ class XApiService:
         else:
             user = await self._user(ident, by)
             uid = user.id
+
+        # count tells X how big a page to build; without it the pool default (20)
+        # would make a limit=200 request cost ten upstream round trips.
+        kv: dict[str, Any] = {"count": limit}
+        if cursor is not None:
+            kv["cursor"] = cursor
+
+        # The *_raw generators yield whole responses, which is the only place the
+        # next cursor exists - the parsed User stream drops it.
         source = (
-            self.api.followers(uid, limit=limit)
+            self.api.followers_raw(uid, limit=limit, kv=kv)
             if kind == "followers"
-            else self.api.following(uid, limit=limit)
+            else self.api.following_raw(uid, limit=limit, kv=kv)
         )
-        users = await _collect_users(source, limit)
+        users, next_cursor = await _collect_user_pages(source, limit, self.api._get_cursor)
         return {
             "kind": kind,
             "user": user_to_dict(user) if user is not None else None,
             "users": users,
             "count": len(users),
+            "next_cursor": next_cursor,
         }
 
     async def tweet(self, tweet_id: int) -> dict[str, Any]:

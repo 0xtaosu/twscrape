@@ -29,6 +29,7 @@ from .x_api import (
     XApiUnavailableError,
     parse_bool,
     parse_by,
+    parse_cursor,
     parse_limit,
 )
 
@@ -99,24 +100,32 @@ def api_endpoint_catalog() -> list[dict[str, Any]]:
             "name": "关注者列表",
             "method": "GET",
             "path": "/api/user/{name}/followers",
-            "description": "获取关注该用户的账号；by=id 可按数字 ID 查询，skip_user=true 省去一次资料查询",
+            "description": (
+                "获取关注该用户的账号；by=id 可按数字 ID 查询，skip_user=true 省去一次资料查询；"
+                "把响应里的 next_cursor 回传给 cursor 取下一页"
+            ),
             "params": [
                 {"name": "name", "in": "path", "required": True, "example": "xdevelopers"},
                 {"name": "limit", "in": "query", "required": False, "example": "20"},
                 {"name": "by", "in": "query", "required": False, "example": "id"},
                 {"name": "skip_user", "in": "query", "required": False, "example": "true"},
+                {"name": "cursor", "in": "query", "required": False, "example": ""},
             ],
         },
         {
             "name": "关注列表",
             "method": "GET",
             "path": "/api/user/{name}/following",
-            "description": "获取该用户正在关注的账号；by=id 可按数字 ID 查询，skip_user=true 省去一次资料查询",
+            "description": (
+                "获取该用户正在关注的账号；by=id 可按数字 ID 查询，skip_user=true 省去一次资料查询；"
+                "把响应里的 next_cursor 回传给 cursor 取下一页"
+            ),
             "params": [
                 {"name": "name", "in": "path", "required": True, "example": "xdevelopers"},
                 {"name": "limit", "in": "query", "required": False, "example": "20"},
                 {"name": "by", "in": "query", "required": False, "example": "id"},
                 {"name": "skip_user", "in": "query", "required": False, "example": "true"},
+                {"name": "cursor", "in": "query", "required": False, "example": ""},
             ],
         },
         {
@@ -738,9 +747,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 and parts[3] in {"followers", "following"}
             ):
                 skip_user = parse_bool(query.get("skip_user", [None])[0], name="skip_user")
+                cursor = parse_cursor(query.get("cursor", [None])[0])
                 queue = "Followers" if parts[3] == "followers" else "Following"
                 method = getattr(self.server.x_api, parts[3])
-                self._send_json(self._run(method(parts[2], limit, by, skip_user)))
+                self._send_json(self._run(method(parts[2], limit, by, skip_user, cursor)))
                 return
             if len(parts) == 3 and parts[:2] == ["api", "tweet"]:
                 queue = "TweetDetail"

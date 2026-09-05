@@ -290,7 +290,25 @@ curl -X POST -H "Authorization: Bearer $TWS_API_KEY" \
 curl http://127.0.0.1:8000/healthz
 ```
 
-The batch endpoint accepts at most 100 user IDs and processes them sequentially. Per-user failures
+`followers` and `following` are cursor-paginated. Every response carries a `next_cursor`; pass it
+back as `cursor` to get the next page, and stop when it comes back `null`:
+
+```bash
+curl -H "Authorization: Bearer $TWS_API_KEY" \
+  'http://127.0.0.1:8000/api/user/xdevelopers/following?limit=100'
+# {"kind": "following", "users": [...], "count": 100, "next_cursor": "1771337970390780275|2085474368099450818"}
+curl -H "Authorization: Bearer $TWS_API_KEY" \
+  'http://127.0.0.1:8000/api/user/xdevelopers/following?limit=100&cursor=1771337970390780275%7C2085474368099450818'
+```
+
+X paginates by page, not by user, and a cursor points at a page boundary. Pages are therefore always
+returned whole: `limit` sets the page size requested from X, and `count` - not `limit` - is how many
+users the response actually holds. It can overshoot `limit` when X returns a larger page than asked
+for. Truncating to `limit` would be worse: the users between the cut and the boundary would be
+skipped by the next cursor and lost silently. Read `count` and follow `next_cursor`.
+
+The batch endpoint accepts at most 100 user IDs and processes them sequentially. Each entry carries
+its own `next_cursor`, so a user with more followings than one page can be paged separately. Per-user failures
 are returned inside the ordered `results` array; pool exhaustion aborts the batch with `503` and a
 `Retry-After` header when an active account has a known unlock time. Upstream calls time out instead
 of retaining a request thread indefinitely.
