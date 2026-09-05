@@ -34,8 +34,8 @@ def guess_delim(line: str):
 
 
 class AccountsPool:
-    # _order_by: str = "RANDOM()"
-    _order_by: str = "username"
+    # Persistent round robin across queues and processes, independent of clock resolution.
+    _order_by: str = "_last_selected, username"
 
     def __init__(
         self,
@@ -290,9 +290,10 @@ class AccountsPool:
         # if space in condition, it's a subquery, otherwise it's username
         condition = f"({condition})" if " " in condition else f"'{condition}'"
 
-        if int(sqlite3.sqlite_version_info[1]) >= 35:
+        if sqlite3.sqlite_version_info >= (3, 35, 0):
             qs = f"""
             UPDATE accounts SET
+                _last_selected = (SELECT COALESCE(MAX(_last_selected), 0) + 1 FROM accounts),
                 locks = json_set(locks, '$.{queue}', datetime('now', '+15 minutes')),
                 last_used = datetime({utc.ts()}, 'unixepoch')
             WHERE username = {condition}
@@ -303,6 +304,7 @@ class AccountsPool:
             tx = uuid.uuid4().hex
             qs = f"""
             UPDATE accounts SET
+                _last_selected = (SELECT COALESCE(MAX(_last_selected), 0) + 1 FROM accounts),
                 locks = json_set(locks, '$.{queue}', datetime('now', '+15 minutes')),
                 last_used = datetime({utc.ts()}, 'unixepoch'),
                 _tx = '{tx}'

@@ -99,12 +99,21 @@ async def migrate(db: aiosqlite.Connection):
             """
         )
 
+    async def v6():
+        await db.execute(
+            "ALTER TABLE accounts ADD COLUMN _last_selected INTEGER NOT NULL DEFAULT 0"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS accounts_last_selected ON accounts (_last_selected)"
+        )
+
     migrations = {
         1: v1,
         2: v2,
         3: v3,
         4: v4,
         5: v5,
+        6: v6,
     }
 
     # logger.debug(f"Current migration v{uv} (latest v{len(migrations)})")

@@ -312,9 +312,11 @@ class QueueClient:
         return await self.req("GET", url, params=params)
 
     async def req(self, method: HttpMethod, url: str, params: ReqParams = None) -> Response | None:
+        # Yield after each completed request, including pagination. Retries below
+        # retain their context and backoff until the existing error policy rotates it.
+        if self.ctx is not None and self.ctx.req_count > 0:
+            await self._close_ctx()
         while True:
-            # 1. same ctx until _close_ctx() clears it — that's retry vs rotate
-            # 2. no aclose() needed here, __aexit__ handles it
             ctx = await self._get_ctx()
             if ctx is None:
                 return None

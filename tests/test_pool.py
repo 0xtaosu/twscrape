@@ -1,8 +1,75 @@
+import asyncio
+
 import pytest
 
 from twscrape.accounts_pool import AccountsPool, NoAccountError
 from twscrape.api import API
+from twscrape.db import fetchone
 from twscrape.utils import utc
+
+
+@pytest.mark.parametrize("sqlite_version", [(3, 24, 0), (3, 35, 0)])
+async def test_round_robin_persists_across_pools(pool_mock, monkeypatch, sqlite_version):
+    monkeypatch.setattr("twscrape.accounts_pool.sqlite3.sqlite_version_info", sqlite_version)
+    for username in ("a", "b", "c"):
+        await pool_mock.add_account_cookies(username, "auth_token=token; ct0=csrf")
+    # Historical imbalance must not concentrate new traffic on a catch-up account.
+    account = await pool_mock.get("a")
+    account.stats = {"SearchTimeline": 10000}
+    await pool_mock.save(account)
+
+    selected = []
+    for i in range(12):
+        pool = AccountsPool(pool_mock._db_file)
+        queue = ("SearchTimeline", "UserTweets")[i % 2]
+        account = await pool.get_for_queue(queue)
+        assert account is not None
+        selected.append(account.username)
+        await pool.unlock(account.username, queue, req_count=1)
+
+    assert selected == ["a", "b", "c"] * 4
+
+
+async def test_round_robin_skips_unavailable_accounts(pool_mock):
+    for username in ("a", "b", "c", "d"):
+        await pool_mock.add_account_cookies(username, "auth_token=token; ct0=csrf")
+    await pool_mock.set_active("a", False)
+    await pool_mock.lock_until("b", "SearchTimeline", utc.ts() + 900)
+    selected = []
+    for _ in range(6):
+        account = await pool_mock.get_for_queue("SearchTimeline")
+        assert account is not None
+        selected.append(account.username)
+        await pool_mock.unlock(account.username, "SearchTimeline")
+    assert selected == ["c", "d"] * 3
+    await pool_mock.reset_locks("b")
+    account = await pool_mock.get_for_queue("SearchTimeline")
+    assert account is not None and account.username == "b"
+
+
+@pytest.mark.parametrize("sqlite_version", [(3, 24, 0), (3, 35, 0)])
+async def test_concurrent_selection_is_exclusive(pool_mock, monkeypatch, sqlite_version):
+    # pytest uses a fresh event loop per test; a contended asyncio lock binds to it.
+    monkeypatch.setattr("twscrape.db._lock", asyncio.Lock())
+    monkeypatch.setattr("twscrape.accounts_pool.sqlite3.sqlite_version_info", sqlite_version)
+    for username in ("a", "b", "c"):
+        await pool_mock.add_account_cookies(username, "auth_token=token; ct0=csrf")
+    accounts = await asyncio.gather(
+        *[AccountsPool(pool_mock._db_file).get_for_queue("SearchTimeline") for _ in range(8)]
+    )
+    selected = [acc.username for acc in accounts if acc is not None]
+    assert sorted(selected) == ["a", "b", "c"]
+    assert accounts.count(None) == 5
+
+
+async def test_saving_account_preserves_scheduling_state(pool_mock):
+    await pool_mock.add_account_cookies("a", "auth_token=token; ct0=csrf")
+    stale = await pool_mock.get("a")
+    await pool_mock.get_for_queue("SearchTimeline")
+    await pool_mock.unlock("a", "SearchTimeline")
+    await pool_mock.save(stale)
+    row = await fetchone(pool_mock._db_file, "SELECT _last_selected FROM accounts")
+    assert row["_last_selected"] == 1
 
 
 async def test_add_accounts(pool_mock: AccountsPool):

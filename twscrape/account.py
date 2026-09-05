@@ -48,6 +48,8 @@ class Account(JSONTrait):
     @staticmethod
     def from_rs(rs: sqlite3.Row) -> "Account":
         doc = dict(rs)
+        # Scheduling state belongs to the pool; saving a stale Account must not reset it.
+        doc.pop("_last_selected", None)
         doc["locks"] = {k: utc.from_iso(v) for k, v in json.loads(doc["locks"]).items()}
         doc["stats"] = {k: v for k, v in json.loads(doc["stats"]).items() if isinstance(v, int)}
         doc["headers"] = json.loads(doc["headers"])

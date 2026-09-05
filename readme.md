@@ -110,6 +110,15 @@ async for tweet in api.search("open source lang:en", limit=100):
     print(tweet.id, tweet.rawContent)
 ```
 
+Accounts are selected in persistent round-robin order across operations. Each completed
+request yields its account before the next request, including pagination, so long queries
+also share the pool. Selection and queue locking are atomic in SQLite, and processes using
+the same database share the rotation. Inactive accounts and accounts locked for the requested
+operation are skipped. Transient retries retain the same account and existing backoff;
+rate limits and failure cooldowns still apply. Historical request totals do not cause a
+new or lightly used account to receive a burst of catch-up traffic. With only one eligible
+account, requests continue using that account. Rotation does not impose a request-rate cap.
+
 Configure what happens when no account is immediately available:
 
 ```python

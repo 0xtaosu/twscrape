@@ -40,7 +40,6 @@ def pool_mock(tmp_path):
 async def client_fixture(pool_mock: AccountsPool, monkeypatch):
     mock_clt = MockClient()
     monkeypatch.setattr(Account, "make_client", lambda self, proxy=None: mock_clt)
-    pool_mock._order_by = "username"
 
     for x in range(1, 3):
         await pool_mock.add_account(

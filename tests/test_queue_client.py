@@ -53,24 +53,26 @@ async def test_lock_account_when_used(client_fixture: CF):
     assert len(locked) == 0
 
 
-async def test_do_not_switch_account_on_200(client_fixture: CF):
+async def test_rotate_account_between_successful_requests(client_fixture: CF):
     pool, client, mock = client_fixture
 
     await client.__aenter__()
     locked1 = await get_locked(pool)
     assert len(locked1) == 1
 
-    for x in range(3):
+    usernames = []
+    for x in range(6):
         mock.add_response(json={"foo": x})
         rep = await client.get(URL)
         assert rep is not None
         assert rep.json() == {"foo": x}
+        usernames.append(getattr(rep, "__username"))
 
-    locked2 = await get_locked(pool)
-    assert locked1 == locked2
+    assert usernames == ["user1", "user2"] * 3
 
     await client.__aexit__(None, None, None)
     assert len(await get_locked(pool)) == 0
+    assert [acc.stats["SearchTimeline"] for acc in await pool.get_all()] == [3, 3]
 
 
 async def test_switch_acc_on_http_error(client_fixture: CF):
@@ -199,7 +201,7 @@ async def test_ctx_closed_on_break(client_fixture: CF):
 
                 rep = await c.get(URL)
 
-                if check_retry:
+                if counter > 1:
                     assert before_ctx != c.ctx
                 elif before_ctx is not None:
                     assert before_ctx == c.ctx
