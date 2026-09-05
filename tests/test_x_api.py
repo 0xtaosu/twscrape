@@ -141,7 +141,8 @@ class FakeAPI:
             self.closed = True
 
     def _get_cursor(self, obj: dict[str, Any], cursor_type: str = "Bottom") -> str | None:
-        return obj.get("__cursor")
+        value = obj.get("__cursor")
+        return value if isinstance(value, str) else None
 
     async def followers_raw(self, user_id: int, limit: int, kv=None):
         self.graph_method, self.graph_uid, self.graph_kv = "followers", user_id, dict(kv or {})
