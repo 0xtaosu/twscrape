@@ -274,6 +274,7 @@ async def login(acc: Account, cfg: LoginConfig | None = None) -> Account:
         client.headers["x-twitter-auth-type"] = "OAuth2Session"
 
         acc.active = True
+        acc.manual_disabled = False
         acc.headers = dict(client.headers.items())
         acc.cookies = dict(client.cookies.items())
         return acc

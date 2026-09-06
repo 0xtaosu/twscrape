@@ -14,8 +14,10 @@ const state = {
   summary: null,
   expanded: null,
   editing: null,
+  editingInitialActive: false,
   pendingDelete: null,
   openDeleteOnEditClose: false,
+  loading: true,
   loadError: "",
 };
 
@@ -50,6 +52,7 @@ const els = {
   editActive: document.querySelector("#editActive"),
   editCookies: document.querySelector("#editCookies"),
   editProxyStatus: document.querySelector("#editProxyStatus"),
+  editProxySource: document.querySelector("#editProxySource"),
   editProxyKeep: document.querySelector("#editProxyKeep"),
   editProxySet: document.querySelector("#editProxySet"),
   editProxyClear: document.querySelector("#editProxyClear"),
@@ -151,25 +154,27 @@ function formatDateTime(value) {
   return date.toLocaleString("zh-CN", { hour12: false });
 }
 
-function primaryAction(account) {
-  if (account.next_action === "add_cookie") {
-    return { action: "add_cookie", label: "添加 Cookie", className: "action-add" };
-  }
-  if (account.next_action === "enable") {
-    return { action: "enable", label: "启用", className: "action-enable" };
-  }
-  if (Number(account.lock_count) > 0) {
-    return { action: "reset", label: "清锁", className: "action-reset" };
-  }
-  if (account.active) {
-    return { action: "disable", label: "停用", className: "action-disable" };
-  }
-  return null;
+function isAdminDisabled(account) {
+  return Boolean(account.manual_disabled) || account.status === "disabled";
+}
+
+function needsCookieRepair(account) {
+  return (
+    !account.has_session ||
+    account.attention_reason === "session_missing" ||
+    account.attention_reason === "auth_error"
+  );
+}
+
+function proxyHostPort(display) {
+  if (!display) return "";
+  const idx = String(display).indexOf("://");
+  return idx >= 0 ? String(display).slice(idx + 3) : String(display);
 }
 
 function lockRecovery(account) {
   const count = Number(account.lock_count) || 0;
-  if (!count) return { text: "—", title: "" };
+  if (!count) return { text: "当前没有本地锁", title: "" };
   const wait = formatDuration(account.next_unlock_in_seconds);
   const queues = Array.isArray(account.locked_queues)
     ? account.locked_queues.join(", ")
@@ -234,7 +239,7 @@ function renderDetailRow(account) {
   const tr = document.createElement("tr");
   tr.className = "detail-row";
   const td = document.createElement("td");
-  td.colSpan = 7;
+  td.colSpan = 6;
   const grid = document.createElement("div");
   grid.className = "detail-grid";
 
@@ -251,6 +256,22 @@ function renderDetailRow(account) {
       }))
     : [];
 
+  const lockCard = renderDetailCard("本地锁", locks, "当前没有本地锁");
+  const recovery = lockRecovery(account);
+  if (Number(account.lock_count) > 0) {
+    if (recovery.text) {
+      const note = appendText(lockCard, "p", recovery.text, "detail-empty");
+      if (recovery.title) note.title = recovery.title;
+    }
+    const reset = document.createElement("button");
+    reset.type = "button";
+    reset.className = "link-action";
+    reset.dataset.action = "reset";
+    reset.dataset.user = String(account.username || "");
+    reset.textContent = "清除本地锁";
+    lockCard.appendChild(reset);
+  }
+
   const errorCard = document.createElement("div");
   errorCard.className = "detail-card";
   appendText(errorCard, "h3", "错误信息");
@@ -263,12 +284,49 @@ function renderDetailRow(account) {
 
   grid.append(
     renderDetailCard("各队列请求", queues, "还没有请求记录"),
-    renderDetailCard("本地锁", locks, "当前没有本地锁"),
+    lockCard,
     errorCard
   );
   td.appendChild(grid);
   tr.appendChild(td);
   return tr;
+}
+
+function renderProxyCell(account) {
+  const td = labeledCell("代理", "cell-proxy");
+  const source = account.proxy_source;
+  const accountDisplay = account.proxy_display;
+  const effective = account.effective_proxy_display;
+
+  if (source === "env") {
+    if (effective) {
+      const code = appendText(td, "code", proxyHostPort(effective), "proxy-addr");
+      code.title = effective;
+    } else {
+      appendText(td, "span", "—", "muted");
+    }
+    appendText(td, "span", "全局 TWS_PROXY", "proxy-source");
+    return td;
+  }
+
+  if (accountDisplay) {
+    const code = appendText(td, "code", proxyHostPort(accountDisplay), "proxy-addr");
+    code.title = accountDisplay;
+    return td;
+  }
+
+  appendText(td, "span", "—", "muted");
+  if (account.has_proxy) td.title = "代理地址无法安全显示";
+  return td;
+}
+
+function sessionMeta(account) {
+  const method = loginLabel(account.login_method);
+  if (account.attention_reason === "auth_error" || account.error_message) {
+    return `${method} · 会话已失效`;
+  }
+  if (account.has_session) return `${method} · Cookie 已添加`;
+  return `${method} · 缺少 Cookie`;
 }
 
 function syncAttentionFilter() {
@@ -285,6 +343,16 @@ function renderAccounts() {
 
   if (!accounts.length) {
     els.empty.hidden = false;
+    if (state.loading && !state.accounts.length) {
+      els.emptyTitle.textContent = "正在加载账号";
+      els.emptyHint.textContent = "正在读取本机账号池";
+      return;
+    }
+    if (state.loadError && !state.accounts.length) {
+      els.emptyTitle.textContent = "无法加载账号";
+      els.emptyHint.textContent = state.loadError;
+      return;
+    }
     const hasAny = state.accounts.length > 0;
     els.emptyTitle.textContent = hasAny ? "没有匹配的账号" : "还没有账号";
     els.emptyHint.textContent = hasAny
@@ -314,55 +382,59 @@ function renderAccounts() {
     const cell = document.createElement("div");
     cell.className = "account-cell";
     appendText(cell, "span", state.expanded === username ? "▾" : "▸", "chevron");
-    const avatar = appendText(cell, "span", username.slice(0, 1) || "?", "avatar");
-    avatar.setAttribute("aria-hidden", "true");
-    appendText(cell, "span", `@${username}`, "account-name");
+    const identity = document.createElement("div");
+    identity.className = "account-identity";
+    appendText(identity, "span", `@${username}`, "account-name");
+    const meta = appendText(identity, "span", sessionMeta(account), "account-meta");
+    if (needsCookieRepair(account)) {
+      const repair = document.createElement("button");
+      repair.type = "button";
+      repair.className = "link-action";
+      repair.dataset.action = "add_cookie";
+      repair.dataset.user = username;
+      repair.textContent = "修复 Cookie";
+      meta.append(" · ");
+      meta.appendChild(repair);
+    }
+    cell.appendChild(identity);
     nameTd.appendChild(cell);
 
     const statusTd = labeledCell("状态", "cell-status");
-    const statusBlock = document.createElement("div");
-    statusBlock.className = "status-block";
     const statusKey = STATUS_LABELS[account.status] ? account.status : "disabled";
     appendText(
-      statusBlock,
+      statusTd,
       "span",
       account.status_label || STATUS_LABELS[statusKey] || account.status,
       `status status-${statusKey}`
     );
-    if (account.status_detail) {
-      appendText(statusBlock, "span", String(account.status_detail), "status-detail");
-    }
-    statusTd.appendChild(statusBlock);
 
-    const loginTd = labeledCell("登录方式");
-    loginTd.textContent = loginLabel(account.login_method);
+    const proxyTd = renderProxyCell(account);
 
-    const reqTd = labeledCell("总请求");
+    const reqTd = labeledCell("总请求", "cell-requests");
     reqTd.textContent = Number(account.total_requests || 0).toLocaleString("zh-CN");
 
     const usedTd = labeledCell("最后使用", "cell-meta");
     usedTd.textContent = relativeTime(account.last_used);
     if (account.last_used) usedTd.title = formatDateTime(account.last_used);
 
-    const lockTd = labeledCell("锁恢复");
-    const recovery = lockRecovery(account);
-    lockTd.textContent = recovery.text;
-    if (recovery.title) lockTd.title = recovery.title;
-    if (recovery.text === "—") lockTd.classList.add("cell-meta");
-
     const actionTd = labeledCell("操作", "cell-actions");
     const actions = document.createElement("div");
     actions.className = "row-actions";
-    const action = primaryAction(account);
-    if (action) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.dataset.action = action.action;
-      button.dataset.user = username;
-      button.className = action.className;
-      button.textContent = action.label;
-      actions.appendChild(button);
+
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    if (isAdminDisabled(account)) {
+      toggle.dataset.action = "enable";
+      toggle.className = "action-enable";
+      toggle.textContent = "启用";
+    } else {
+      toggle.dataset.action = "disable";
+      toggle.className = "action-disable";
+      toggle.textContent = "停用";
     }
+    toggle.dataset.user = username;
+    actions.appendChild(toggle);
+
     const manage = document.createElement("button");
     manage.type = "button";
     manage.dataset.action = "manage";
@@ -374,7 +446,7 @@ function renderAccounts() {
     actions.appendChild(manage);
     actionTd.appendChild(actions);
 
-    tr.append(nameTd, statusTd, loginTd, reqTd, usedTd, lockTd, actionTd);
+    tr.append(nameTd, statusTd, proxyTd, reqTd, usedTd, actionTd);
     fragment.appendChild(tr);
     if (state.expanded === username) {
       fragment.appendChild(renderDetailRow(account));
@@ -460,6 +532,8 @@ function resetEditForm() {
   els.editUsernameDisplay.textContent = "";
   els.editProxyStatus.textContent = "未配置";
   els.editProxyStatus.classList.remove("is-configured");
+  els.editProxySource.hidden = true;
+  els.editProxySource.textContent = "";
   els.editProxyKeep.checked = true;
   els.editSubmit.disabled = false;
   els.editSubmit.textContent = "保存更改";
@@ -495,11 +569,29 @@ function openEditDialog(username) {
   if (!account) return;
   resetEditForm();
   state.editing = String(account.username || "");
+  const adminEnabled = !isAdminDisabled(account);
+  state.editingInitialActive = adminEnabled;
   els.editUsernameDisplay.textContent = `@${state.editing}`;
-  els.editActive.checked = Boolean(account.active);
-  const hasProxy = Boolean(account.has_proxy);
-  els.editProxyStatus.textContent = hasProxy ? "已配置" : "未配置";
-  els.editProxyStatus.classList.toggle("is-configured", hasProxy);
+  els.editActive.checked = adminEnabled;
+  if (account.proxy_display) {
+    els.editProxyStatus.textContent = account.proxy_display;
+    els.editProxyStatus.classList.add("is-configured");
+  } else if (account.has_proxy) {
+    els.editProxyStatus.textContent = "已配置，但无法安全显示";
+    els.editProxyStatus.classList.remove("is-configured");
+  } else {
+    els.editProxyStatus.textContent = "未配置";
+    els.editProxyStatus.classList.remove("is-configured");
+  }
+  if (account.proxy_source === "env") {
+    els.editProxySource.hidden = false;
+    els.editProxySource.textContent = account.effective_proxy_display
+      ? `全局 TWS_PROXY 覆盖账号代理，当前代理地址为 ${account.effective_proxy_display}`
+      : "全局 TWS_PROXY 覆盖账号代理，地址无法显示";
+  } else {
+    els.editProxySource.hidden = true;
+    els.editProxySource.textContent = "";
+  }
   els.editProxyKeep.checked = true;
   syncProxyInputVisibility();
   if (typeof els.editDialog.showModal === "function") {
@@ -575,17 +667,20 @@ function clearSensitiveInputs() {
   clearEditSecrets();
 }
 
-function setSync(text) {
+function setSync(text, isError = false) {
   els.updated.textContent = text;
+  els.updated.classList.toggle("is-error", Boolean(isError));
 }
 
 async function loadAccounts() {
+  if (!state.accounts.length) state.loading = true;
   setSync("正在刷新");
   try {
     const data = await api("/admin/accounts");
     state.accounts = Array.isArray(data.accounts) ? data.accounts : [];
     state.summary = data.summary || null;
     state.loadError = "";
+    state.loading = false;
     if (state.expanded && !state.accounts.some((item) => item.username === state.expanded)) {
       state.expanded = null;
     }
@@ -601,8 +696,10 @@ async function loadAccounts() {
     );
   } catch (error) {
     state.loadError = error.message || "无法读取账号池";
+    state.loading = false;
     renderSummary();
-    setSync("刷新失败");
+    renderAccounts();
+    setSync("刷新失败", true);
     showToast(state.loadError, true);
   }
 }
@@ -698,11 +795,18 @@ els.editForm.addEventListener("submit", async (event) => {
     return;
   }
   const payload = {
-    active: Boolean(els.editActive.checked),
     proxy_mode: proxyMode,
   };
+  const nextActive = Boolean(els.editActive.checked);
+  if (nextActive !== Boolean(state.editingInitialActive)) {
+    payload.active = nextActive;
+  }
   if (cookies) payload.cookies = cookies;
   if (proxyMode === "set") payload.proxy = proxy;
+  if (payload.active === undefined && !cookies && proxyMode === "keep") {
+    setEditFormError("没有需要更新的字段");
+    return;
+  }
   els.editSubmit.disabled = true;
   els.deleteAccountButton.disabled = true;
   const original = els.editSubmit.textContent;
@@ -870,5 +974,6 @@ window.addEventListener("pageshow", (event) => {
 });
 
 loadSession();
+renderAccounts();
 loadAccounts();
 setInterval(loadAccounts, POLL_MS);

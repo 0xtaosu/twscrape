@@ -4,7 +4,12 @@ from typing import Any, cast
 import pytest
 
 from twscrape.accounts_pool import AccountsPool
-from twscrape.dashboard import DashboardAuth, DashboardService, resolve_dashboard_credentials
+from twscrape.dashboard import (
+    DashboardAuth,
+    DashboardService,
+    account_proxy_fields,
+    resolve_dashboard_credentials,
+)
 from twscrape.utils import utc
 
 
@@ -12,7 +17,7 @@ async def test_dashboard_snapshot_exposes_only_safe_fields(pool_mock: AccountsPo
     await pool_mock.add_account_cookies("ready-user", "auth_token=secret; ct0=csrf-secret")
     account = await pool_mock.get("ready-user")
     account.email = "private@example.com"
-    account.proxy = "http://private-proxy"
+    account.proxy = "http://proxyuser:proxy-secret@10.0.0.1:8080"
     account.stats = {"SearchTimeline": 7}
     await pool_mock.save(account)
 
@@ -32,12 +37,17 @@ async def test_dashboard_snapshot_exposes_only_safe_fields(pool_mock: AccountsPo
     assert item["status"] == "ready"
     assert item["status_label"] == "可用"
     assert item["has_proxy"] is True
+    assert item["proxy_display"] == "http://10.0.0.1:8080"
+    assert item["effective_proxy_display"] == "http://10.0.0.1:8080"
+    assert item["proxy_source"] == "account"
     assert item["total_requests"] == 7
     assert item["requests_by_queue"] == [{"queue": "SearchTimeline", "count": 7}]
     assert "cookies" not in item
     assert "password" not in item
     assert "email" not in item
     assert "proxy" not in item
+    assert "proxy-secret" not in str(snapshot)
+    assert "proxyuser" not in str(snapshot)
     assert "secret" not in str(snapshot)
 
 
@@ -61,7 +71,7 @@ async def test_dashboard_account_actions_are_scoped(pool_mock: AccountsPool):
     assert (await pool_mock.get("second")).active is True
 
 
-async def test_dashboard_updates_cookie_active_and_write_only_proxy(pool_mock: AccountsPool):
+async def test_dashboard_updates_cookie_active_and_displays_safe_proxy(pool_mock: AccountsPool):
     await pool_mock.add_account_cookies("editable", "auth_token=old; ct0=old-csrf")
     service = DashboardService(pool_mock)
 
@@ -76,10 +86,12 @@ async def test_dashboard_updates_cookie_active_and_write_only_proxy(pool_mock: A
     account = await pool_mock.get("editable")
     assert account.cookies == {"auth_token": "new", "ct0": "new-csrf"}
     assert account.active is False
+    assert account.manual_disabled is True
     assert account.proxy == "http://127.0.0.1:8080"
     snapshot = await service.snapshot()
     assert snapshot["accounts"][0]["has_proxy"] is True
-    assert "127.0.0.1" not in str(snapshot)
+    assert snapshot["accounts"][0]["proxy_display"] == "http://127.0.0.1:8080"
+    assert "userinfo" not in str(snapshot).lower()
 
     await service.update_account(
         "editable", active=None, cookies=None, proxy_mode="clear", proxy=None
@@ -344,7 +356,9 @@ def test_batch_following_validates_limit_and_preserves_ids(pool_mock: AccountsPo
 
         async def following_batch(self, ids, limit, skip_user):
             self.calls.append((ids, limit, skip_user))
-            return {"results": [{"id": str(uid), "ok": True, "users": [], "count": 0} for uid in ids]}
+            return {
+                "results": [{"id": str(uid), "ok": True, "users": [], "count": 0} for uid in ids]
+            }
 
     server = DashboardServer(
         ("127.0.0.1", 0),
@@ -558,3 +572,185 @@ def test_following_forwards_cursor_and_returns_next_cursor(pool_mock: AccountsPo
         server.shutdown()
         serve_thread.join(timeout=5)
         server.server_close()
+
+
+def test_account_proxy_fields_report_env_override_without_credentials(monkeypatch):
+    class FakeAccount:
+        proxy = "http://accuser:accpass@1.2.3.4:8080"
+
+    monkeypatch.setenv("TWS_PROXY", "socks5://envuser:envpass@9.9.9.9:1080")
+    has_proxy, display, effective, source = account_proxy_fields(FakeAccount())
+    assert has_proxy is True
+    assert display == "http://1.2.3.4:8080"
+    assert effective == "socks5://9.9.9.9:1080"
+    assert source == "env"
+    assert "accpass" not in (display or "")
+    assert "envpass" not in (effective or "")
+
+
+def test_account_proxy_fields_fail_closed_on_malformed_env(monkeypatch):
+    class FakeAccount:
+        proxy = "http://1.2.3.4:8080"
+
+    monkeypatch.setenv("TWS_PROXY", "not-a-proxy")
+    has_proxy, display, effective, source = account_proxy_fields(FakeAccount())
+    assert has_proxy is True
+    assert display == "http://1.2.3.4:8080"
+    assert effective is None
+    assert source == "env"
+
+
+async def test_dashboard_snapshot_uses_env_proxy_source(pool_mock: AccountsPool, monkeypatch):
+    monkeypatch.setenv("TWS_PROXY", "http://envuser:env-secret@9.9.9.9:1080")
+    await pool_mock.add_account_cookies("ready-user", "auth_token=a; ct0=b")
+    account = await pool_mock.get("ready-user")
+    account.proxy = "http://accuser:acc-secret@1.2.3.4:8080"
+    await pool_mock.save(account)
+
+    snapshot = await DashboardService(pool_mock).snapshot()
+    item = snapshot["accounts"][0]
+    assert item["proxy_display"] == "http://1.2.3.4:8080"
+    assert item["effective_proxy_display"] == "http://9.9.9.9:1080"
+    assert item["proxy_source"] == "env"
+    assert "env-secret" not in str(snapshot)
+    assert "acc-secret" not in str(snapshot)
+
+
+async def test_missing_cookie_account_is_never_ready_and_can_be_disabled(pool_mock: AccountsPool):
+    await pool_mock.add_account("bare", "pass", "email", "ep")
+    await pool_mock.set_active("bare", True)
+    service = DashboardService(pool_mock)
+
+    snapshot = await service.snapshot()
+    item = snapshot["accounts"][0]
+    assert item["has_session"] is False
+    assert item["status"] == "attention"
+    assert item["status"] != "ready"
+    assert item["manual_disabled"] is False
+
+    await service.set_active("bare", False)
+    account = await pool_mock.get("bare")
+    assert account.active is False
+    assert account.manual_disabled is True
+    assert account.cookies == {}
+
+    snapshot = await service.snapshot()
+    item = snapshot["accounts"][0]
+    assert item["status"] == "disabled"
+    assert item["manual_disabled"] is True
+    assert item["has_session"] is False
+
+
+async def test_auto_failure_stays_attention_until_manual_disable(pool_mock: AccountsPool):
+    await pool_mock.add_account_cookies("failed", "auth_token=a; ct0=b")
+    await pool_mock.mark_inactive("failed", "session expired")
+    service = DashboardService(pool_mock)
+
+    snapshot = await service.snapshot()
+    item = snapshot["accounts"][0]
+    assert item["status"] == "attention"
+    assert item["manual_disabled"] is False
+    assert item["error_message"] == "session expired"
+    assert item["next_action"] == "add_cookie"
+
+    await service.set_active("failed", False)
+    account = await pool_mock.get("failed")
+    assert account.active is False
+    assert account.manual_disabled is True
+    assert account.error_msg == "session expired"
+    assert account.cookies == {"auth_token": "a", "ct0": "b"}
+
+    snapshot = await service.snapshot()
+    item = snapshot["accounts"][0]
+    assert item["status"] == "disabled"
+    assert item["error_message"] == "session expired"
+
+
+async def test_proxy_only_edit_does_not_activate_auto_failed_account(pool_mock: AccountsPool):
+    await pool_mock.add_account_cookies("failed", "auth_token=a; ct0=b")
+    await pool_mock.mark_inactive("failed", "session expired")
+
+    await DashboardService(pool_mock).update_account(
+        "failed",
+        active=None,
+        cookies=None,
+        proxy_mode="set",
+        proxy="10.0.0.1:8080",
+    )
+
+    account = await pool_mock.get("failed")
+    assert account.active is False
+    assert account.manual_disabled is False
+    assert account.error_msg == "session expired"
+    assert account.proxy == "http://10.0.0.1:8080"
+    snapshot = await DashboardService(pool_mock).snapshot()
+    assert snapshot["accounts"][0]["status"] == "attention"
+
+
+async def test_edit_path_can_manually_disable_without_full_account_save(
+    pool_mock: AccountsPool,
+):
+    await pool_mock.add_account_cookies("editable", "auth_token=old; ct0=old-csrf")
+    account = await pool_mock.get("editable")
+    account.stats = {"SearchTimeline": 4}
+    account.error_msg = "stale"
+    await pool_mock.save(account)
+
+    await DashboardService(pool_mock).update_account(
+        "editable",
+        active=False,
+        cookies=None,
+        proxy_mode="keep",
+        proxy=None,
+    )
+
+    same = await pool_mock.get("editable")
+    assert same.active is False
+    assert same.manual_disabled is True
+    assert same.cookies == {"auth_token": "old", "ct0": "old-csrf"}
+    assert same.error_msg == "stale"
+    assert same.stats == {"SearchTimeline": 4}
+
+
+async def test_add_cookie_and_snapshot_preserve_manual_disable(pool_mock: AccountsPool):
+    await pool_mock.add_account_cookies("kept", "auth_token=old; ct0=old-csrf")
+    service = DashboardService(pool_mock)
+    await service.set_active("kept", False)
+
+    await service.add_cookie_account("kept", "auth_token=new; ct0=new-csrf")
+    account = await pool_mock.get("kept")
+    assert account.active is False
+    assert account.manual_disabled is True
+    assert account.cookies == {"auth_token": "new", "ct0": "new-csrf"}
+    assert account.error_msg is None
+
+    snapshot = await service.snapshot()
+    item = snapshot["accounts"][0]
+    assert item["status"] == "disabled"
+    assert item["manual_disabled"] is True
+    assert item["has_session"] is True
+
+    await service.set_active("kept", True)
+    enabled = await pool_mock.get("kept")
+    assert enabled.active is True
+    assert enabled.manual_disabled is False
+    assert (await service.snapshot())["accounts"][0]["status"] == "ready"
+
+
+async def test_historical_inactive_and_auth_failures_are_not_reinterpreted(
+    pool_mock: AccountsPool,
+):
+    await pool_mock.add_account("waiting", "pass", "email", "ep")
+    await pool_mock.add_account_cookies("expired", "auth_token=a; ct0=b")
+    await pool_mock.mark_inactive("expired", "login error")
+    service = DashboardService(pool_mock)
+
+    snapshot = await service.snapshot()
+    by_name = {item["username"]: item for item in snapshot["accounts"]}
+    assert by_name["waiting"]["has_session"] is False
+    assert by_name["waiting"]["status"] == "disabled"
+    assert by_name["waiting"]["status"] != "attention"
+    assert by_name["waiting"]["manual_disabled"] is False
+    assert by_name["expired"]["status"] == "attention"
+    assert by_name["expired"]["manual_disabled"] is False
+    assert by_name["expired"]["status"] != "disabled"

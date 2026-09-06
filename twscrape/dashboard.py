@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .accounts_pool import AccountsPool, NoAccountError
 from .api_keys import ApiKeyStore
-from .utils import get_env_bool, parse_proxy, utc
+from .utils import get_env_bool, parse_proxy, safe_proxy_display, utc
 from .x_api import (
     XApiNotFoundError,
     XApiService,
@@ -43,8 +43,12 @@ MAX_LOGIN_FAILURES = 5
 class DashboardAccountInfo(TypedDict):
     username: str
     active: bool
+    manual_disabled: bool
     has_session: bool
     has_proxy: bool
+    proxy_display: str | None
+    effective_proxy_display: str | None
+    proxy_source: str | None
     login_method: str
     status: str
     status_label: str
@@ -65,6 +69,22 @@ class DashboardAccountInfo(TypedDict):
 
 class DashboardAccountNotFoundError(ValueError):
     pass
+
+
+def account_proxy_fields(account: Any) -> tuple[bool, str | None, str | None, str | None]:
+    """Safe account/effective proxy display for the dashboard.
+
+    Runtime API-specific overrides are not known here. ``TWS_PROXY`` is the
+    only process-wide override this service can report.
+    """
+    has_proxy = bool(account.proxy)
+    proxy_display = safe_proxy_display(account.proxy)
+    env_raw = os.getenv("TWS_PROXY")
+    if env_raw is not None and str(env_raw).strip():
+        return has_proxy, proxy_display, safe_proxy_display(env_raw), "env"
+    if has_proxy:
+        return has_proxy, proxy_display, proxy_display, "account"
+    return False, None, None, None
 
 
 def api_endpoint_catalog() -> list[dict[str, Any]]:
@@ -271,7 +291,13 @@ class DashboardService:
             active_locks = {
                 queue: unlock_at for queue, unlock_at in account.locks.items() if unlock_at > now
             }
-            if account.error_msg:
+            if account.manual_disabled:
+                status = "disabled"
+                status_label = "已停用"
+                status_detail = "手动停用，不参与账号轮换"
+                attention_reason = None
+                next_action = "enable"
+            elif account.error_msg:
                 status = "attention"
                 status_label = "需处理"
                 status_detail = str(account.error_msg)[:120]
@@ -280,7 +306,7 @@ class DashboardService:
             elif not account.active:
                 status = "disabled"
                 status_label = "已停用"
-                status_detail = "手动停用，不参与账号轮换"
+                status_detail = "未启用，不参与账号轮换"
                 attention_reason = None
                 next_action = "enable"
             elif not account.has_session:
@@ -314,13 +340,20 @@ class DashboardService:
                 )
             ]
             needs_attention = status == "attention"
+            has_proxy, proxy_display, effective_proxy_display, proxy_source = account_proxy_fields(
+                account
+            )
 
             items.append(
                 {
                     "username": account.username,
                     "active": account.active,
+                    "manual_disabled": bool(account.manual_disabled),
                     "has_session": account.has_session,
-                    "has_proxy": bool(account.proxy),
+                    "has_proxy": has_proxy,
+                    "proxy_display": proxy_display,
+                    "effective_proxy_display": effective_proxy_display,
+                    "proxy_source": proxy_source,
                     "login_method": account.login_method,
                     "status": status,
                     "status_label": status_label,
@@ -425,12 +458,12 @@ class DashboardService:
 
         if cookies:
             await self.pool.add_account_cookies(username, cookies)
-            account = await self.pool.get(username)
 
-        account.proxy = next_proxy
+        if proxy_mode != "keep":
+            await self.pool.set_proxy(username, next_proxy)
+
         if active is not None:
-            account.active = active
-        await self.pool.save(account)
+            await self.pool.set_active(username, active)
 
     async def delete_account(self, username: str) -> None:
         if await self.pool.get_account(username) is None:
@@ -736,9 +769,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 include_replies = parse_bool(query.get("include_replies", [None])[0])
                 queue = "UserTweetsAndReplies" if include_replies else "UserTweets"
                 self._send_json(
-                    self._run(
-                        self.server.x_api.user_tweets(parts[2], limit, include_replies, by)
-                    )
+                    self._run(self.server.x_api.user_tweets(parts[2], limit, include_replies, by))
                 )
                 return
             if (

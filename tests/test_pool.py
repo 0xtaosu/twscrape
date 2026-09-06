@@ -347,6 +347,42 @@ async def test_mark_inactive(pool_mock: AccountsPool):
     acc = await pool_mock.get("user1")
     assert acc.active is False
     assert acc.error_msg == "banned by system"
+    assert acc.manual_disabled is False
+
+
+async def test_set_active_persists_manual_disabled_without_clearing_session(
+    pool_mock: AccountsPool,
+):
+    await pool_mock.add_account_cookies("user1", "auth_token=token; ct0=csrf")
+    account = await pool_mock.get("user1")
+    account.error_msg = "stale"
+    await pool_mock.save(account)
+
+    await pool_mock.set_active("user1", False)
+    disabled = await pool_mock.get("user1")
+    assert disabled.active is False
+    assert disabled.manual_disabled is True
+    assert disabled.cookies == {"auth_token": "token", "ct0": "csrf"}
+    assert disabled.error_msg == "stale"
+
+    await pool_mock.set_active("user1", True)
+    enabled = await pool_mock.get("user1")
+    assert enabled.active is True
+    assert enabled.manual_disabled is False
+    assert enabled.cookies == {"auth_token": "token", "ct0": "csrf"}
+    assert enabled.error_msg == "stale"
+
+
+async def test_add_account_cookies_does_not_undo_manual_disable(pool_mock: AccountsPool):
+    await pool_mock.add_account_cookies("user1", "auth_token=old; ct0=old-csrf")
+    await pool_mock.set_active("user1", False)
+
+    await pool_mock.add_account_cookies("user1", "auth_token=new; ct0=new-csrf")
+    same = await pool_mock.get("user1")
+    assert same.active is False
+    assert same.manual_disabled is True
+    assert same.cookies == {"auth_token": "new", "ct0": "new-csrf"}
+    assert same.error_msg is None
 
 
 async def test_next_available_at_none_when_empty(pool_mock: AccountsPool):
