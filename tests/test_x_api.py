@@ -214,7 +214,13 @@ async def test_social_graph_returns_page_and_cursor(pool_mock, kind: str):
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [(None, "username"), ("username", "username"), ("login", "username"), ("id", "id"), ("uid", "id")],
+    [
+        (None, "username"),
+        ("username", "username"),
+        ("login", "username"),
+        ("id", "id"),
+        ("uid", "id"),
+    ],
 )
 def test_parse_by(value: str | None, expected: str):
     assert parse_by(value) == expected
