@@ -10,6 +10,13 @@ from twscrape.dashboard import (
     account_proxy_fields,
     resolve_dashboard_credentials,
 )
+from twscrape.mcp import (
+    INVALID_REQUEST,
+    METHOD_NOT_FOUND,
+    PARSE_ERROR,
+    PROTOCOL_VERSION,
+    tool_catalog,
+)
 from twscrape.utils import utc
 
 
@@ -754,3 +761,197 @@ async def test_historical_inactive_and_auth_failures_are_not_reinterpreted(
     assert by_name["expired"]["status"] == "attention"
     assert by_name["expired"]["manual_disabled"] is False
     assert by_name["expired"]["status"] != "disabled"
+
+
+def test_mcp_endpoint_requires_api_key_and_rejects_session_cookie(
+    pool_mock: AccountsPool, tmp_path
+):
+    """/mcp 只认 API 密钥。
+
+    其他写操作都靠 CSRF token 兜底，而外部 MCP 客户端拿不到那个 token。
+    如果这里认会话 cookie，/mcp 就成了跨站页面唯一能借用户身份打到的
+    状态变更 POST。
+    """
+    import json
+    import threading
+    import urllib.error
+    import urllib.request
+
+    from twscrape.dashboard import SESSION_COOKIE, DashboardAuth, DashboardServer
+
+    class McpXApi:
+        calls: list[tuple] = []
+
+        async def user(self, ident: str, by: str = "username"):
+            self.calls.append((ident, by))
+            return {"id": "42", "username": ident}
+
+    auth = DashboardAuth("admin", "password123")
+    session_token = auth.create_session()
+    server = DashboardServer(("127.0.0.1", 0), pool_mock, auth, str(tmp_path / "mcp.db"))
+    fake = McpXApi()
+    server.x_api = cast(Any, fake)
+    _, api_token = server.runner.run(server.api_keys.create("mcp-client"))
+    serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    serve_thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+
+    def request(path, method="POST", payload=None, headers=None, raw=None):
+        body = raw if raw is not None else (json.dumps(payload).encode() if payload else None)
+        req = urllib.request.Request(
+            f"{base_url}{path}", data=body, headers=headers or {}, method=method
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                text = response.read()
+                return response.status, (json.loads(text) if text else None), response.headers
+        except urllib.error.HTTPError as error:
+            text = error.read()
+            return error.code, (json.loads(text) if text else None), error.headers
+
+    def mcp(payload, headers=None):
+        base = {"Content-Type": "application/json", "Authorization": f"Bearer {api_token}"}
+        base.update(headers or {})
+        return request("/mcp", payload=payload, headers=base)
+
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+
+    try:
+        status, body, _ = mcp(init)
+        assert status == 200
+        assert body["result"]["protocolVersion"] == PROTOCOL_VERSION
+
+        # No key, and a dashboard session is explicitly not a key.
+        for headers in ({}, {"Cookie": f"{SESSION_COOKIE}={session_token}"}):
+            status, _, response_headers = request(
+                "/mcp",
+                payload=init,
+                headers={"Content-Type": "application/json", **headers},
+            )
+            assert status == 401
+            assert response_headers["WWW-Authenticate"] == 'Bearer realm="twscrape"'
+
+        # A revoked key stops working immediately.
+        _, throwaway = server.runner.run(server.api_keys.create("short-lived"))
+        keys = server.runner.run(server.api_keys.list())
+        target = next(key for key in keys if key["name"] == "short-lived")
+        server.runner.run(server.api_keys.revoke(target["id"], "short-lived"))
+        status, _, _ = request(
+            "/mcp",
+            payload=init,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {throwaway}"},
+        )
+        assert status == 401
+
+        # Tool calls reach the same read-only facade the JSON API uses.
+        status, body, _ = mcp(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "get_user", "arguments": {"user": "alice"}},
+            }
+        )
+        assert status == 200
+        assert body["result"]["isError"] is False
+        assert body["result"]["structuredContent"] == {"id": "42", "username": "alice"}
+        assert fake.calls == [("alice", "username")]
+
+        # Notifications carry no reply.
+        status, body, _ = mcp({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        assert status == 202
+        assert body is None
+
+        # Broken JSON is a parse error, not a crash.
+        status, body, _ = request(
+            "/mcp",
+            raw=b"{not json",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_token}"},
+        )
+        assert status == 400
+        assert body["error"]["code"] == PARSE_ERROR
+
+        # Non-JSON bodies never reach the parser.
+        status, body, _ = request(
+            "/mcp",
+            raw=b"hello",
+            headers={"Content-Type": "text/plain", "Authorization": f"Bearer {api_token}"},
+        )
+        assert status == 400
+        assert body["error"]["code"] == INVALID_REQUEST
+
+        # Unknown method is a JSON-RPC error with HTTP 200, per the spec.
+        status, body, _ = mcp({"jsonrpc": "2.0", "id": 3, "method": "resources/list"})
+        assert status == 200
+        assert body["error"]["code"] == METHOD_NOT_FOUND
+        assert body["id"] == 3
+
+        # DNS-rebinding guard: a browser on another origin is turned away.
+        status, _, _ = mcp(init, {"Origin": "http://evil.example"})
+        assert status == 403
+        status, _, _ = mcp(init, {"Origin": f"http://127.0.0.1:{server.server_port}"})
+        assert status == 200
+
+        # Version handshake.
+        status, _, _ = mcp(init, {"MCP-Protocol-Version": "2024-11-05"})
+        assert status == 200
+        status, body, _ = mcp(init, {"MCP-Protocol-Version": "1999-01-01"})
+        assert status == 400
+        assert PROTOCOL_VERSION in body["supported"]
+
+        # There is no stream to open and no session to delete.
+        for method in ("GET", "DELETE"):
+            status, _, response_headers = request(
+                "/mcp",
+                method=method,
+                headers={"Authorization": f"Bearer {api_token}"},
+            )
+            assert status == 405
+            assert response_headers["Allow"] == "POST"
+    finally:
+        server.shutdown()
+        serve_thread.join(timeout=5)
+        server.server_close()
+
+
+def test_mcp_metadata_is_session_scoped_and_matches_catalog(pool_mock: AccountsPool, tmp_path):
+    """控制台靠 /admin/mcp 渲染工具列表，它必须和实际 tools/list 一致。"""
+    import json
+    import threading
+    import urllib.error
+    import urllib.request
+
+    from twscrape.dashboard import SESSION_COOKIE, DashboardAuth, DashboardServer
+
+    auth = DashboardAuth("admin", "password123")
+    session_token = auth.create_session()
+    server = DashboardServer(("127.0.0.1", 0), pool_mock, auth, str(tmp_path / "mcp-meta.db"))
+    _, api_token = server.runner.run(server.api_keys.create("meta-client"))
+    serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    serve_thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+
+    def get(headers):
+        request = urllib.request.Request(f"{base_url}/admin/mcp", headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, None
+
+    try:
+        assert get({})[0] == 401
+        # The API key opens /mcp itself, not the console's admin surface.
+        assert get({"Authorization": f"Bearer {api_token}"})[0] == 401
+
+        status, body = get({"Cookie": f"{SESSION_COOKIE}={session_token}"})
+        assert status == 200
+        assert body["path"] == "/mcp"
+        assert body["transport"] == "http"
+        assert body["protocol_version"] == PROTOCOL_VERSION
+        assert [tool["name"] for tool in body["tools"]] == [tool["name"] for tool in tool_catalog()]
+        assert all(tool["title"] and tool["description"] for tool in body["tools"])
+    finally:
+        server.shutdown()
+        serve_thread.join(timeout=5)
+        server.server_close()

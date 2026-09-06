@@ -16,12 +16,25 @@ from datetime import datetime
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.metadata import PackageNotFoundError, version
 from importlib.resources import files
 from typing import Any, TypedDict
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .accounts_pool import AccountsPool, NoAccountError
 from .api_keys import ApiKeyStore
+from .mcp import (
+    INTERNAL_ERROR,
+    INVALID_REQUEST,
+    PARSE_ERROR,
+    PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    McpError,
+    McpService,
+    error_response,
+    handle_message,
+    tool_catalog,
+)
 from .utils import get_env_bool, parse_proxy, safe_proxy_display, utc
 from .x_api import (
     XApiNotFoundError,
@@ -33,6 +46,7 @@ from .x_api import (
     parse_limit,
 )
 
+MCP_PATH = "/mcp"
 SESSION_COOKIE = "twscrape_session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
 LOGIN_WINDOW_SECONDS = 5 * 60
@@ -173,6 +187,13 @@ def api_endpoint_catalog() -> list[dict[str, Any]]:
             "params": [],
         },
     ]
+
+
+def package_version() -> str:
+    try:
+        return version("twscrape")
+    except PackageNotFoundError:
+        return "0.0.0"
 
 
 class DashboardAuth:
@@ -520,6 +541,7 @@ class DashboardServer(ThreadingHTTPServer):
         self.auth = auth
         self.trusted_proxy = trusted_proxy
         self.csrf_token = secrets.token_urlsafe(32)
+        self.version = package_version()
 
     def server_close(self) -> None:
         super().server_close()
@@ -654,11 +676,113 @@ class DashboardHandler(BaseHTTPRequestHandler):
             headers,
         )
 
+    def _require_mcp_auth(self) -> bool:
+        """MCP is API-key only - deliberately not accepting the session cookie.
+
+        Every other write path is guarded by the CSRF token, which an external
+        MCP client cannot produce. Honouring the dashboard cookie here would
+        make /mcp the one state-changing POST a cross-site page could reach with
+        the user's ambient credentials, so the bearer key is the only key.
+        """
+        token = self._bearer_token()
+        if token and self._run(self.server.api_keys.validate(token)):
+            return True
+        self._send_json(
+            {"error": "MCP 需要 API 密钥（Authorization: Bearer tws_…）"},
+            HTTPStatus.UNAUTHORIZED,
+            {"WWW-Authenticate": 'Bearer realm="twscrape"'},
+        )
+        return False
+
+    def _mcp_origin_allowed(self) -> bool:
+        """DNS-rebinding guard the MCP spec requires of local HTTP servers.
+
+        Native clients send no Origin at all; only a browser does, and a browser
+        on another origin has no business here.
+        """
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        host = self.headers.get("Host", "")
+        return origin in {f"http://{host}", f"https://{host}"}
+
+    def _mcp_protocol_allowed(self) -> bool:
+        # Absent means the pre-header revision, which this server still speaks.
+        requested = self.headers.get("MCP-Protocol-Version")
+        return requested is None or requested in SUPPORTED_PROTOCOL_VERSIONS
+
+    def _send_mcp_error(self, code: int, message: str, status: int = HTTPStatus.OK) -> None:
+        self._send_json(error_response(None, code, message), status)
+
+    def _handle_mcp(self) -> None:
+        if not self._mcp_origin_allowed():
+            self._send_json({"error": "Origin 校验失败"}, HTTPStatus.FORBIDDEN)
+            return
+        if not self._mcp_protocol_allowed():
+            self._send_json(
+                {
+                    "error": "不支持的 MCP 协议版本",
+                    "supported": list(SUPPORTED_PROTOCOL_VERSIONS),
+                },
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if not self._require_mcp_auth():
+            return
+
+        try:
+            message = self._read_mcp_body()
+        except json.JSONDecodeError:
+            self._send_mcp_error(PARSE_ERROR, "JSON 解析失败", HTTPStatus.BAD_REQUEST)
+            return
+        except ValueError as error:
+            self._send_mcp_error(INVALID_REQUEST, str(error), HTTPStatus.BAD_REQUEST)
+            return
+
+        message_id = message.get("id") if isinstance(message, dict) else None
+        service = McpService(self.server.x_api, self.server.service.api_health)
+        try:
+            response = self._run(handle_message(service, message, self.server.version))
+        except McpError as error:
+            self._send_json(error_response(message_id, error.code, str(error), error.data))
+            return
+        except FutureTimeoutError:
+            self._send_json(error_response(message_id, INTERNAL_ERROR, "上游请求超时"))
+            return
+        except Exception:
+            self._send_json(error_response(message_id, INTERNAL_ERROR, "工具调用失败"))
+            return
+
+        if response is None:
+            # A notification carries no reply; 202 is what the spec asks for.
+            self._send_bytes(b"", "application/json; charset=utf-8", HTTPStatus.ACCEPTED)
+            return
+        self._send_json(response)
+
+    def _read_mcp_body(self) -> Any:
+        if self.headers.get_content_type() != "application/json":
+            raise ValueError("请求格式必须为 JSON")
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0 or length > 1_000_000:
+            raise ValueError("请求内容为空或过大")
+        return json.loads(self.rfile.read(length))
+
+    def _reject_mcp_method(self) -> None:
+        """No server-initiated stream and no session to delete - 405 both ways."""
+        self._send_json(
+            {"error": "MCP 仅支持 POST"},
+            HTTPStatus.METHOD_NOT_ALLOWED,
+            {"Allow": "POST"},
+        )
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/healthz":
             self._send_json({"ok": True})
+            return
+        if path == MCP_PATH:
+            self._reject_mcp_method()
             return
         assets = files("twscrape").joinpath("dashboard_assets")
         if path == "/dashboard.css":
@@ -715,6 +839,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not self._require_session_auth():
                 return
             self._send_json({"keys": self._run(self.server.api_keys.list())})
+            return
+        if path == "/admin/mcp":
+            if not self._require_session_auth():
+                return
+            self._send_json(
+                {
+                    "path": MCP_PATH,
+                    "transport": "http",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "tools": [
+                        {
+                            "name": tool["name"],
+                            "title": tool.get("title", tool["name"]),
+                            "description": tool.get("description", ""),
+                        }
+                        for tool in tool_catalog()
+                    ],
+                }
+            )
             return
         if (
             path == "/api"
@@ -809,6 +952,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == MCP_PATH:
+            self._handle_mcp()
+            return
         if path == "/api/users/following/batch":
             if not self._require_data_api_auth():
                 return
@@ -869,6 +1015,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._handle_mutation("PATCH")
 
     def do_DELETE(self) -> None:
+        if urlparse(self.path).path == MCP_PATH:
+            self._reject_mcp_method()
+            return
         if not self._require_session_auth():
             return
         self._handle_mutation("DELETE")

@@ -5,6 +5,7 @@ const BEARER_PLACEHOLDER = "tws_your_key_here";
 
 const state = {
   endpoints: [],
+  mcp: null,
   selectedEndpoint: null,
   keys: [],
   hasSent: false,
@@ -25,6 +26,14 @@ const els = {
   apiStatus: document.querySelector("#apiStatus"),
   resultMeta: document.querySelector("#resultMeta"),
   tryApi: document.querySelector("#tryApi"),
+  mcpEndpoint: document.querySelector("#mcpEndpoint"),
+  mcpProtocol: document.querySelector("#mcpProtocol"),
+  mcpConfig: document.querySelector("#mcpConfig"),
+  mcpCli: document.querySelector("#mcpCli"),
+  mcpTools: document.querySelector("#mcpTools"),
+  mcpError: document.querySelector("#mcpError"),
+  copyMcpConfig: document.querySelector("#copyMcpConfig"),
+  copyKeyMcp: document.querySelector("#copyKeyMcp"),
   keyRows: document.querySelector("#keyRows"),
   keysEmpty: document.querySelector("#keysEmpty"),
   keysEmptyTitle: document.querySelector("#keysEmptyTitle"),
@@ -281,6 +290,82 @@ async function loadEndpoints() {
   }
 }
 
+function mcpUrl() {
+  const path = state.mcp && state.mcp.path ? String(state.mcp.path) : "/mcp";
+  return `${location.origin}${path}`;
+}
+
+function mcpConfigText(keyToken) {
+  const key = keyToken || BEARER_PLACEHOLDER;
+  return JSON.stringify(
+    {
+      mcpServers: {
+        twscrape: {
+          type: "http",
+          url: mcpUrl(),
+          headers: { Authorization: `Bearer ${key}` },
+        },
+      },
+    },
+    null,
+    2
+  );
+}
+
+function mcpCliText(keyToken) {
+  const key = keyToken || BEARER_PLACEHOLDER;
+  return [
+    "claude mcp add --transport http twscrape \\",
+    `  ${mcpUrl()} \\`,
+    `  --header "Authorization: Bearer ${key}"`,
+  ].join("\n");
+}
+
+async function copyText(value, okMessage) {
+  try {
+    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+      throw new Error("clipboard unavailable");
+    }
+    await navigator.clipboard.writeText(value);
+    showToast(okMessage);
+    return true;
+  } catch {
+    showToast("无法自动复制，请手动选择文本复制", true);
+    return false;
+  }
+}
+
+function renderMcp() {
+  els.mcpEndpoint.textContent = mcpUrl();
+  els.mcpProtocol.textContent =
+    state.mcp && state.mcp.protocol_version ? String(state.mcp.protocol_version) : "—";
+  els.mcpConfig.textContent = mcpConfigText("");
+  els.mcpCli.textContent = mcpCliText("");
+
+  els.mcpTools.replaceChildren();
+  const tools = state.mcp && Array.isArray(state.mcp.tools) ? state.mcp.tools : [];
+  for (const tool of tools) {
+    const li = document.createElement("li");
+    appendText(li, "code", String(tool.name || ""), "mcp-tool-name");
+    appendText(li, "span", String(tool.title || ""), "mcp-tool-title");
+    appendText(li, "span", String(tool.description || ""), "mcp-tool-desc");
+    els.mcpTools.appendChild(li);
+  }
+}
+
+async function loadMcp() {
+  renderMcp();
+  try {
+    state.mcp = await api("/admin/mcp");
+    els.mcpError.hidden = true;
+    els.mcpError.textContent = "";
+    renderMcp();
+  } catch (error) {
+    els.mcpError.textContent = error.message || "无法读取 MCP 接入信息";
+    els.mcpError.hidden = false;
+  }
+}
+
 function renderKeys() {
   els.keyRows.replaceChildren();
   if (!state.keys.length) {
@@ -401,6 +486,7 @@ function showCreateSetup() {
 
 function clearCreatedToken() {
   state.createdToken = "";
+  els.copyKeyMcp.disabled = true;
   state.tokenCanClose = false;
   els.keyToken.value = "";
   setCopyHint("");
@@ -453,6 +539,7 @@ function showCreatedToken(plainToken) {
   els.createKeyTitle.textContent = "保存 API 密钥";
   els.createKeyLead.textContent = "明文只显示这一次。请复制并放到安全的地方。";
   els.keyToken.value = value;
+  els.copyKeyMcp.disabled = false;
   els.copyKey.disabled = false;
   els.copyKey.textContent = "复制";
   els.confirmSaved.disabled = true;
@@ -684,6 +771,19 @@ els.createKeyForm.addEventListener("submit", async (event) => {
 });
 
 els.copyKey.addEventListener("click", copyCreatedToken);
+
+els.copyMcpConfig.addEventListener("click", () => {
+  copyText(mcpConfigText(""), "MCP 配置已复制，记得替换成你的密钥");
+});
+
+// The plaintext key exists only here, so this is the one place the config can be
+// handed over complete instead of with a placeholder.
+els.copyKeyMcp.addEventListener("click", async () => {
+  if (!state.createdToken) return;
+  if (await copyText(mcpConfigText(state.createdToken), "MCP 配置（含密钥）已复制")) {
+    allowTokenClose();
+  }
+});
 els.manualCopyConfirm.addEventListener("change", () => {
   if (els.manualCopyConfirm.checked) {
     els.confirmSaved.textContent = "我已手动保存";
@@ -790,4 +890,5 @@ window.addEventListener("pageshow", (event) => {
 showCurlPreview();
 loadSession();
 loadEndpoints();
+loadMcp();
 loadKeys();
