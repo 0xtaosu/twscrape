@@ -39,6 +39,7 @@ TWS_HTTP_BACKEND=curl twscrape user_by_login xdevelopers
 - Saved account sessions and per-account proxies
 - Raw Twitter API responses and parsed SNScrape-compatible models
 - Automatic account switching across rate-limited operations
+- Local dashboard with a read-only JSON API and an MCP endpoint for agents
 
 ## Sponsor
 
@@ -271,7 +272,8 @@ The dashboard binds to `127.0.0.1`, reads the same `accounts.db` as the CLI, and
 passwords, email credentials, cookie values, or proxy usernames/passwords to the browser. Account
 proxy endpoints are shown as `scheme://host[:port]` only. If `TWS_PROXY` is set, the UI reports that
 global override separately instead of implying the account proxy is in use. Account management lives
-at `/accounts`; the JSON API playground and API key management live at `/console`. Use `--db` to select
+at `/accounts`; the JSON API playground, MCP connection details, and API key management live
+at `/console`. Use `--db` to select
 a different account database and `--no-open` when running without a desktop browser. The default
 dashboard username is `admin`; override it with `TWS_DASHBOARD_USERNAME`. When started from an
 interactive terminal without `TWS_DASHBOARD_PASSWORD`, the CLI securely prompts for the password
@@ -330,6 +332,48 @@ access only the read-only `/api/**` namespace; account and key management under 
 requires a dashboard session. The API is intentionally read-only and local-only. It was inspired by the MIT-licensed
 [`w95/x-api`](https://github.com/w95/x-api) project, while reusing this process's existing database
 and account rotation instead of loading a second session file.
+
+### MCP endpoint
+
+The same process also speaks [MCP](https://modelcontextprotocol.io), so an agent can call the pool
+directly instead of shelling out to `curl`. The endpoint is `POST /mcp` (Streamable HTTP, JSON-RPC
+2.0) and it authenticates with the same API key as `/api/**` - `/console` shows the ready-to-paste
+config and, right after you create a key, can copy it with the key already filled in.
+
+```bash
+claude mcp add --transport http twscrape \
+  http://127.0.0.1:8000/mcp \
+  --header "Authorization: Bearer $TWS_API_KEY"
+```
+
+Clients configured by file want the same three things:
+
+```json
+{
+  "mcpServers": {
+    "twscrape": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp",
+      "headers": { "Authorization": "Bearer tws_your_key_here" }
+    }
+  }
+}
+```
+
+Seven read-only tools are exposed: `search_tweets`, `get_user`, `get_user_tweets`,
+`get_user_followers`, `get_user_following`, `get_tweet`, and `get_pool_health`. They map onto the
+same facade as the JSON API, so pagination behaves identically - follow `next_cursor` and read
+`count`, not `limit`. `get_tweet` takes its id as a string because tweet ids run past 2^53, where a
+JSON number would silently drop digits.
+
+Bad arguments, missing users, and a drained account pool come back as MCP tool errors (`isError`),
+not transport failures, so the model can read the reason and retry or adjust. Only a malformed
+JSON-RPC message or an unknown tool name is a protocol error.
+
+The endpoint deliberately does not accept the dashboard session cookie: every other state-changing
+POST is guarded by a CSRF token that an external MCP client cannot produce, and honouring the cookie
+here would make `/mcp` reachable by a cross-site page riding the user's ambient session. It also
+validates `Origin` when one is present, per the spec's DNS-rebinding guidance for local servers.
 
 When the dashboard runs directly behind a trusted Cloudflare Tunnel connector, set
 `TWS_TRUSTED_PROXY=1` to key login rate limits by the validated `CF-Connecting-IP` header. Leave it

@@ -53,6 +53,43 @@
         </div>
       </section>
 
+      <section class="keys mcp" aria-labelledby="mcpHeading">
+        <div class="keys-head">
+          <h2 id="mcpHeading">MCP 接入</h2>
+          <button type="button" class="secondary" id="copyMcpConfig">复制配置</button>
+        </div>
+        <div class="mcp-body">
+          <dl class="mcp-facts">
+            <div>
+              <dt>地址</dt>
+              <dd id="mcpEndpoint">—</dd>
+            </div>
+            <div>
+              <dt>传输</dt>
+              <dd>Streamable HTTP · POST</dd>
+            </div>
+            <div>
+              <dt>协议版本</dt>
+              <dd id="mcpProtocol">—</dd>
+            </div>
+            <div>
+              <dt>鉴权</dt>
+              <dd>Bearer + 下方 API 密钥</dd>
+            </div>
+          </dl>
+          <p class="endpoint-desc">
+            把下面的配置粘进 MCP 客户端，并把
+            <code>tws_your_key_here</code> 换成下方新建的密钥。明文只在创建时显示一次。
+          </p>
+          <pre id="mcpConfig" tabindex="0" aria-label="MCP 客户端配置"></pre>
+          <p class="endpoint-desc">Claude Code 也可以直接执行：</p>
+          <pre id="mcpCli" tabindex="0" aria-label="命令行接入示例"></pre>
+          <p class="page-error" id="mcpError" hidden></p>
+          <h3 class="mcp-subhead" id="mcpToolsHeading">可用工具</h3>
+          <ul class="mcp-tools" id="mcpTools" aria-labelledby="mcpToolsHeading"></ul>
+        </div>
+      </section>
+
       <section class="keys" aria-labelledby="keysHeading">
         <div class="keys-head">
           <h2 id="keysHeading">API 密钥</h2>
@@ -124,6 +161,7 @@
           </label>
           <div class="dialog-actions">
             <button type="button" class="secondary" id="confirmSaved" disabled>我已保存</button>
+            <button type="button" class="secondary" id="copyKeyMcp">复制 MCP 配置</button>
             <button type="button" class="primary" id="copyKey">复制</button>
           </div>
         </div>

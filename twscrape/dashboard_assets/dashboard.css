@@ -828,6 +828,91 @@ dialog input[readonly] {
   font-weight: 650;
 }
 
+.mcp { margin-bottom: 16px; }
+.mcp-body { padding: 14px 14px 18px; }
+
+.mcp-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px 18px;
+  padding: 12px 14px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.mcp-facts dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.mcp-facts dd {
+  margin-top: 4px;
+  font-size: 13px;
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.mcp-body .endpoint-desc { margin-top: 14px; }
+
+#mcpConfig,
+#mcpCli {
+  margin: 8px 0 0;
+  padding: 12px 14px;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre;
+  user-select: all;
+}
+
+.mcp-subhead {
+  margin-top: 20px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.mcp-tools {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+  padding: 0;
+  list-style: none;
+}
+
+.mcp-tools li {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  min-width: 0;
+}
+
+.mcp-tool-name {
+  color: var(--text);
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.mcp-tool-title { color: var(--text); font-size: 13px; }
+
+.mcp-tool-desc {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.mcp-body .page-error { margin-top: 14px; }
+
 dialog {
   width: min(500px, calc(100% - 28px));
   max-height: min(640px, calc(100% - 32px));
@@ -1032,6 +1117,9 @@ dialog form { padding: 20px; }
 
 @media (max-width: 720px) {
   .shell { padding: 12px 16px 40px; }
+
+  .mcp-body { padding: 12px 12px 16px; }
+  .mcp-tools { grid-template-columns: 1fr; }
 
   .topbar {
     grid-template-columns: 1fr auto;
