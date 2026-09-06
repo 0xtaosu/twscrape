@@ -136,7 +136,7 @@ class AccountsPool:
         ON CONFLICT(username) DO UPDATE SET
             cookies = excluded.cookies,
             headers = '{}',
-            active = true,
+            active = CASE WHEN accounts.manual_disabled THEN false ELSE true END,
             error_msg = NULL
         """
         await execute(self._db_file, qs, {"username": username, "cookies": json.dumps(parsed)})
@@ -209,7 +209,10 @@ class AccountsPool:
 
         params = None
         if usernames is None:
-            qs = "SELECT * FROM accounts WHERE active = false AND error_msg IS NULL"
+            qs = """
+            SELECT * FROM accounts
+            WHERE active = false AND error_msg IS NULL AND manual_disabled = false
+            """
         else:
             placeholders, params = self._usernames_where(usernames)
             qs = f"SELECT * FROM accounts WHERE username IN ({placeholders})"
@@ -263,8 +266,21 @@ class AccountsPool:
         await execute(self._db_file, qs, {"username": username})
 
     async def set_active(self, username: str, active: bool):
-        qs = "UPDATE accounts SET active = :active WHERE username = :username"
-        await execute(self._db_file, qs, {"username": username, "active": active})
+        qs = """
+        UPDATE accounts SET
+            active = :active,
+            manual_disabled = :manual_disabled
+        WHERE username = :username
+        """
+        await execute(
+            self._db_file,
+            qs,
+            {"username": username, "active": active, "manual_disabled": not active},
+        )
+
+    async def set_proxy(self, username: str, proxy: str | None):
+        qs = "UPDATE accounts SET proxy = :proxy WHERE username = :username"
+        await execute(self._db_file, qs, {"username": username, "proxy": proxy})
 
     async def lock_until(self, username: str, queue: str, unlock_at: int, req_count=0):
         qs = f"""

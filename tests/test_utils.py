@@ -1,6 +1,6 @@
 import pytest
 
-from twscrape.utils import get_env_bool, parse_cookies, parse_proxy, to_old_obj
+from twscrape.utils import get_env_bool, parse_cookies, parse_proxy, safe_proxy_display, to_old_obj
 
 
 def test_cookies_parse():
@@ -47,6 +47,33 @@ def test_proxy_parse():
 
     # user:pass@host:port (no scheme)
     assert parse_proxy("user:pass@1.2.3.4:8080") == "http://user:pass@1.2.3.4:8080"
+
+
+def test_safe_proxy_display_strips_secrets_and_fails_closed():
+    assert safe_proxy_display(None) is None
+    assert safe_proxy_display("") is None
+    assert safe_proxy_display("   ") is None
+    assert safe_proxy_display("not-a-proxy") is None
+    assert safe_proxy_display("http://") is None
+    assert safe_proxy_display("http://example.com") == "http://example.com"
+    assert safe_proxy_display("https://proxy.example") == "https://proxy.example"
+    assert safe_proxy_display("http://example.com:80") == "http://example.com:80"
+    assert safe_proxy_display("http://example.com:99999") is None
+    assert safe_proxy_display("socks5://127.0.0.1") is None
+    assert safe_proxy_display("ftp://1.2.3.4:8080") is None
+
+    assert safe_proxy_display("http://user:pass@1.2.3.4:8080") == "http://1.2.3.4:8080"
+    assert (
+        safe_proxy_display("http://user:p%40ss@10.0.0.1:8080/path?token=abc#frag")
+        == "http://10.0.0.1:8080"
+    )
+    assert safe_proxy_display("socks5://user:pass@127.0.0.1:1080") == "socks5://127.0.0.1:1080"
+    assert safe_proxy_display("1.2.3.4:8080") == "http://1.2.3.4:8080"
+    assert safe_proxy_display("1.2.3.4:8080:user:s3cret") == "http://1.2.3.4:8080"
+    assert safe_proxy_display("http://user:pass@[2001:db8::1]:8080") == "http://[2001:db8::1]:8080"
+    assert safe_proxy_display("[2001:db8::1]:8080") == "http://[2001:db8::1]:8080"
+    assert "s3cret" not in str(safe_proxy_display("1.2.3.4:8080:user:s3cret"))
+    assert "pass" not in str(safe_proxy_display("http://user:pass@1.2.3.4:8080"))
 
 
 def test_get_env_bool(monkeypatch):

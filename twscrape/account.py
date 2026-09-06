@@ -35,6 +35,7 @@ class Account(JSONTrait):
     proxy: str | None = None
     error_msg: str | None = None
     last_used: datetime | None = None
+    manual_disabled: bool = False
     _tx: str | None = None
 
     @property
@@ -55,6 +56,7 @@ class Account(JSONTrait):
         doc["headers"] = json.loads(doc["headers"])
         doc["cookies"] = json.loads(doc["cookies"])
         doc["active"] = bool(doc["active"])
+        doc["manual_disabled"] = bool(doc.get("manual_disabled", False))
         doc["last_used"] = utc.from_iso(doc["last_used"]) if doc["last_used"] else None
         return Account(**doc)
 

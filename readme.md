@@ -268,8 +268,10 @@ twscrape dashboard
 ```
 
 The dashboard binds to `127.0.0.1`, reads the same `accounts.db` as the CLI, and never returns
-passwords, email credentials, proxies, or cookie values to the browser. Account management lives at
-`/accounts`; the JSON API playground and API key management live at `/console`. Use `--db` to select
+passwords, email credentials, cookie values, or proxy usernames/passwords to the browser. Account
+proxy endpoints are shown as `scheme://host[:port]` only. If `TWS_PROXY` is set, the UI reports that
+global override separately instead of implying the account proxy is in use. Account management lives
+at `/accounts`; the JSON API playground and API key management live at `/console`. Use `--db` to select
 a different account database and `--no-open` when running without a desktop browser. The default
 dashboard username is `admin`; override it with `TWS_DASHBOARD_USERNAME`. When started from an
 interactive terminal without `TWS_DASHBOARD_PASSWORD`, the CLI securely prompts for the password

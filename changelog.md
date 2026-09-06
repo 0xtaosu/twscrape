@@ -1,3 +1,16 @@
+## Unreleased
+
+### Features
+
+- Dashboard account list now shows a safe `scheme://host:port` proxy endpoint and reports when `TWS_PROXY` overrides account settings
+- Manual account disable is persisted separately from automatic auth failures, so missing cookies no longer block disable and cookie repair no longer silently re-enables a manually stopped account
+
+### Fixes
+
+- Removed the claim that proxy hosts themselves are secret; credentials, cookie values, and proxy userinfo remain withheld from the dashboard
+
+---
+
 ## v0.20.1 – 2026-08-25
 
 ### Features

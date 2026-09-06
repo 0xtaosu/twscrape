@@ -1,9 +1,11 @@
 import base64
+import ipaddress
 import json
 import os
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Callable, TypeVar, overload
+from urllib.parse import urlsplit
 
 T = TypeVar("T")
 
@@ -415,6 +417,69 @@ def parse_proxy(proxy: str | None) -> str | None:
         host, port, user, password = parts
         return f"http://{user}:{password}@{host}:{port}"
     return proxy
+
+
+_SAFE_PROXY_SCHEMES = {"http", "https", "socks4", "socks5", "socks5h"}
+
+
+def safe_proxy_display(proxy: str | None) -> str | None:
+    """Return ``scheme://host[:port]`` with credentials and extra parts stripped.
+
+    HTTP/HTTPS without an explicit port keep the default-port form
+    ``scheme://host``. Other schemes still require a valid port. Fail closed:
+    empty or malformed values return ``None``. Never includes username,
+    password, path, query, or fragment.
+    """
+    if proxy is None:
+        return None
+    raw = str(proxy).strip()
+    if not raw:
+        return None
+
+    candidate = raw
+    if "://" not in candidate:
+        if candidate.startswith("[") and "]:" in candidate:
+            candidate = f"http://{candidate}"
+        else:
+            normalized = parse_proxy(candidate)
+            if not normalized or "://" not in normalized:
+                return None
+            candidate = normalized
+
+    try:
+        parts = urlsplit(candidate)
+    except ValueError:
+        return None
+
+    scheme = (parts.scheme or "").lower()
+    if scheme not in _SAFE_PROXY_SCHEMES:
+        return None
+
+    hostname = parts.hostname
+    if not hostname or "/" in hostname or "@" in hostname or " " in hostname:
+        return None
+
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port is None:
+        if scheme not in {"http", "https"}:
+            return None
+    elif not (1 <= port <= 65535):
+        return None
+
+    try:
+        ip = ipaddress.ip_address(hostname)
+        host_out = f"[{hostname}]" if ip.version == 6 else str(ip)
+    except ValueError:
+        if hostname.startswith("[") or hostname.endswith("]"):
+            return None
+        host_out = hostname
+
+    if port is None:
+        return f"{scheme}://{host_out}"
+    return f"{scheme}://{host_out}:{port}"
 
 
 def get_env_bool(key: str, default_val: bool = False) -> bool:
