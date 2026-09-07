@@ -276,6 +276,11 @@ class QueueClient:
             await self._close_ctx(-1, inactive=True, msg=err_msg)
             raise HandledError()
 
+        if has_error(errors, "(353) This request requires a matching csrf cookie and header"):
+            logger.warning(f"CSRF cookie mismatch: {request_log}")
+            await self._close_ctx(-1, inactive=True, msg=err_msg)
+            raise HandledError()
+
         if err_msg == "OK" and rep.status_code == 403:
             logger.warning(f"Session expired or banned: {request_log}")
             await self._close_ctx(-1, inactive=True, msg=None)

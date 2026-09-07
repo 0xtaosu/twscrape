@@ -605,7 +605,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _allow_mutation(self) -> bool:
         host = self.headers.get("Host", "")
         origin = self.headers.get("Origin")
-        same_origin = origin in {None, f"http://{host}"}
+        same_origin = origin in {None, f"http://{host}", f"https://{host}"}
         return same_origin and secrets.compare_digest(
             self.headers.get("X-Twscrape-Token", ""), self.server.csrf_token
         )

@@ -42,7 +42,7 @@ dev = [
 ]
 
 [project.urls]
-repository = "https://github.com/vladkens/twscrape"
+repository = "https://github.com/0xtaosu/twscrape"
 
 [project.scripts]
 twscrape = "twscrape.cli:run"
