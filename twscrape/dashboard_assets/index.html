@@ -69,8 +69,19 @@
                 <option value="disabled">已停用</option>
               </select>
             </label>
+            <button type="button" class="secondary" id="checkAllButton">检测全部</button>
           </div>
           <p class="sync" id="updatedAt" aria-live="polite">正在连接</p>
+        </div>
+
+        <div class="check-panel" id="checkPanel" hidden>
+          <div class="check-head">
+            <p class="check-status" id="checkStatus" aria-live="polite"></p>
+            <button type="button" class="ghost" id="cancelCheckButton" hidden>取消检测</button>
+          </div>
+          <div class="check-track" role="presentation">
+            <span class="check-fill" id="checkFill"></span>
+          </div>
         </div>
 
         <div class="table-wrap">
