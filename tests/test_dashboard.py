@@ -975,3 +975,113 @@ def test_mcp_metadata_is_session_scoped_and_matches_catalog(pool_mock: AccountsP
         server.shutdown()
         serve_thread.join(timeout=5)
         server.server_close()
+
+
+async def test_dashboard_snapshot_reports_check_state(pool_mock: AccountsPool, monkeypatch):
+    from twscrape import checks as checks_module
+    from twscrape.checks import AccountCheck, CheckRegistry, ProbeResult
+
+    await pool_mock.add_account_cookies("checked", "auth_token=secret; ct0=csrf-secret")
+    registry = CheckRegistry(pool_mock)
+    service = DashboardService(pool_mock, registry)
+
+    item = (await service.snapshot())["accounts"][0]
+    assert item["checking"] is False
+    assert item["last_check"] is None
+
+    async def fake_check(acc, *, probes=(), timeout=0.0):
+        return AccountCheck(
+            username=acc.username,
+            state="done",
+            ok=False,
+            reason="session_expired",
+            detail="会话已失效，需要重新导入 Cookie",
+            probes=[
+                ProbeResult("proxy", "ok", "ok", "直连 · 出口 IP 203.0.113.9", 12),
+                ProbeResult("x_live", "failed", "session_expired", "HTTP 401", 33),
+            ],
+            finished_at=utc.now().isoformat(),
+        )
+
+    monkeypatch.setattr(checks_module, "check_account", fake_check)
+    await registry.execute(registry.create(["checked"]))
+
+    snapshot = await service.snapshot()
+    item = snapshot["accounts"][0]
+    assert item["checking"] is False
+    assert item["last_check"]["ok"] is False
+    assert item["last_check"]["reason"] == "session_expired"
+    assert item["last_check"]["reason_label"] == "会话失效"
+    assert [x["probe_label"] for x in item["last_check"]["probes"]] == ["代理", "会话"]
+    assert "csrf-secret" not in str(snapshot)
+
+
+def test_dashboard_check_endpoints_are_session_scoped(pool_mock: AccountsPool, tmp_path):
+    import json
+    import threading
+    import urllib.error
+    import urllib.request
+
+    from twscrape.dashboard import SESSION_COOKIE, DashboardAuth, DashboardServer
+
+    auth = DashboardAuth("admin", "password123")
+    session_token = auth.create_session()
+    server = DashboardServer(("127.0.0.1", 0), pool_mock, auth, str(tmp_path / "checks.db"))
+    _, api_token = server.runner.run(server.api_keys.create("read-only-client"))
+    serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    serve_thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    session = {"Cookie": f"{SESSION_COOKIE}={session_token}"}
+
+    def call(path, headers=None, payload=None):
+        request = urllib.request.Request(
+            f"{base_url}{path}",
+            data=None if payload is None else json.dumps(payload).encode(),
+            headers={
+                **(headers or {}),
+                **(
+                    {}
+                    if payload is None
+                    else {
+                        "Content-Type": "application/json",
+                        "X-Twscrape-Token": server.csrf_token,
+                    }
+                ),
+            },
+            method="GET" if payload is None else "POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return int(response.status), json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    try:
+        assert call("/admin/checks")[0] == 401
+        assert call("/admin/checks", {"Authorization": f"Bearer {api_token}"})[0] == 401
+
+        status, body = call("/admin/checks", session)
+        assert status == 200
+        assert body["run"] is None
+        assert [x["id"] for x in body["probes"]] == ["proxy", "x_live", "gql"]
+        assert body["defaults"]["probes"] == ["proxy", "x_live"]
+
+        # 账号池是空的，没什么可测 —— 但请求本身必须被拒得清清楚楚
+        status, body = call("/admin/checks", session, {"usernames": "all"})
+        assert status == 400
+        assert body["error"] == "没有需要检测的账号"
+
+        status, body = call("/admin/checks", session, {"usernames": ["ghost"]})
+        assert status == 202
+        run_id = body["run"]["id"]
+        assert body["run"]["probes"] == ["proxy", "x_live"]
+        assert body["run"]["apply"] is False
+        assert body["run"]["summary"]["total"] == 1
+
+        assert call(f"/admin/checks/{run_id}", session)[0] == 200
+        assert call("/admin/checks/does-not-exist", session)[0] == 404
+        assert call("/admin/checks/does-not-exist/cancel", session, {})[0] == 404
+    finally:
+        server.shutdown()
+        serve_thread.join(timeout=5)
+        server.server_close()

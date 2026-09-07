@@ -11,7 +11,9 @@ import sys
 import threading
 import time
 import webbrowser
+from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from concurrent.futures import wait as futures_wait
 from datetime import datetime
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
@@ -23,6 +25,15 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .accounts_pool import AccountsPool, NoAccountError
 from .api_keys import ApiKeyStore
+from .checks import (
+    DEFAULT_CONCURRENCY,
+    DEFAULT_PROBES,
+    PROBE_KINDS,
+    PROBE_LABELS,
+    CheckRegistry,
+    parse_concurrency,
+    parse_probes,
+)
 from .mcp import (
     INTERNAL_ERROR,
     INVALID_REQUEST,
@@ -79,6 +90,8 @@ class DashboardAccountInfo(TypedDict):
     requests_by_queue: list[dict[str, Any]]
     last_used: str | None
     error_message: str | None
+    checking: bool
+    last_check: dict[str, Any] | None
 
 
 class DashboardAccountNotFoundError(ValueError):
@@ -287,8 +300,9 @@ def resolve_dashboard_credentials() -> tuple[str, str]:
 class DashboardService:
     """Small, safe facade around AccountsPool for the local dashboard."""
 
-    def __init__(self, pool: AccountsPool):
+    def __init__(self, pool: AccountsPool, checks: CheckRegistry | None = None):
         self.pool = pool
+        self.checks = checks
 
     async def api_health(self) -> dict[str, Any]:
         accounts = await self.pool.get_all()
@@ -307,6 +321,7 @@ class DashboardService:
         accounts = await self.pool.get_all()
         now = utc.now()
         items: list[DashboardAccountInfo] = []
+        check_states = self.checks.account_states() if self.checks else {}
 
         for account in accounts:
             active_locks = {
@@ -361,6 +376,7 @@ class DashboardService:
                 )
             ]
             needs_attention = status == "attention"
+            check_state = check_states.get(account.username, {})
             has_proxy, proxy_display, effective_proxy_display, proxy_source = account_proxy_fields(
                 account
             )
@@ -393,6 +409,8 @@ class DashboardService:
                     "requests_by_queue": request_items,
                     "last_used": account.last_used.isoformat() if account.last_used else None,
                     "error_message": str(account.error_msg)[:120] if account.error_msg else None,
+                    "checking": bool(check_state.get("checking")),
+                    "last_check": check_state.get("last_check"),
                 }
             )
 
@@ -506,6 +524,7 @@ class LoopRunner:
         self._thread = threading.Thread(
             target=self._loop.run_forever, name="twscrape-loop", daemon=True
         )
+        self._pending: set[Future] = set()
         self._thread.start()
 
     def run(self, coroutine: Any, timeout: float | None = 60.0) -> Any:
@@ -516,7 +535,22 @@ class LoopRunner:
             future.cancel()
             raise
 
+    def spawn(self, coroutine: Any) -> None:
+        """把长任务扔进常驻循环、不等结果。
+
+        批量检测几十个账号要跑很久，走 ``run()`` 必然撞上它的 60s 超时。
+        句柄要留着 —— 关服务时得让它们收到取消，而不是连着一堆在途 HTTP
+        请求把循环直接关掉。
+        """
+        future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        self._pending.add(future)
+        future.add_done_callback(self._pending.discard)
+
     def close(self) -> None:
+        if pending := list(self._pending):
+            for future in pending:
+                future.cancel()
+            futures_wait(pending, timeout=2)  # 给取消一点落地的时间，但不无限等
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5)
         self._loop.close()
@@ -535,7 +569,8 @@ class DashboardServer(ThreadingHTTPServer):
     ):
         self.runner = LoopRunner()
         super().__init__(address, DashboardHandler)
-        self.service = DashboardService(pool)
+        self.checks = CheckRegistry(pool)
+        self.service = DashboardService(pool, self.checks)
         self.x_api = XApiService(pool)
         self.api_keys = ApiKeyStore(db_file)
         self.auth = auth
@@ -840,6 +875,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             self._send_json({"keys": self._run(self.server.api_keys.list())})
             return
+        if path == "/admin/checks":
+            if not self._require_session_auth():
+                return
+            self._send_json(
+                {
+                    "probes": [{"id": x, "label": PROBE_LABELS.get(x, x)} for x in PROBE_KINDS],
+                    "defaults": {
+                        "probes": list(DEFAULT_PROBES),
+                        "concurrency": DEFAULT_CONCURRENCY,
+                    },
+                    "run": self.server.checks.latest(),
+                }
+            )
+            return
+        if path.startswith("/admin/checks/"):
+            if not self._require_session_auth():
+                return
+            run = self.server.checks.get(unquote(path[len("/admin/checks/") :]))
+            if run is None:
+                self._send_json({"error": "检测任务不存在"}, HTTPStatus.NOT_FOUND)
+                return
+            self._send_json({"run": run})
+            return
         if path == "/admin/mcp":
             if not self._require_session_auth():
                 return
@@ -1065,6 +1123,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
         cookie = f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
         self._send_json({"ok": True}, headers={"Set-Cookie": cookie})
 
+    def _handle_start_check(self, payload: dict[str, Any]) -> None:
+        allowed = {"usernames", "probes", "apply", "concurrency"}
+        if unknown := set(payload) - allowed:
+            raise ValueError(f"不支持的字段: {', '.join(sorted(unknown))}")
+
+        usernames = payload.get("usernames")
+        if usernames is None or usernames == "all":
+            usernames = [x.username for x in self._run(self.server.service.pool.get_all())]
+        if not isinstance(usernames, list) or not all(isinstance(x, str) for x in usernames):
+            raise ValueError('usernames 必须是字符串数组或 "all"')
+
+        apply_result = payload.get("apply", False)
+        if not isinstance(apply_result, bool):
+            raise ValueError("apply 必须是布尔值")
+
+        run = self.server.checks.create(
+            usernames,
+            probes=parse_probes(payload.get("probes")),
+            apply=apply_result,
+            concurrency=parse_concurrency(payload.get("concurrency")),
+        )
+        # 不等结果：HTTP 立刻拿到 job_id，前端靠轮询看进度
+        self.server.runner.spawn(self.server.checks.execute(run))
+        self._send_json({"run": self.server.checks.get(run.id)}, HTTPStatus.ACCEPTED)
+
     def _handle_mutation(self, method: str) -> None:
         if not self._allow_mutation():
             self._send_json({"error": "请求校验失败，请刷新页面后重试"}, HTTPStatus.FORBIDDEN)
@@ -1083,6 +1166,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"key": info, "token": token}, HTTPStatus.CREATED)
                 return
 
+            if method == "POST" and path == "/admin/checks":
+                self._handle_start_check(payload)
+                return
+
             if method == "POST" and path == "/admin/accounts":
                 self._run(
                     self.server.service.add_cookie_account(
@@ -1093,6 +1180,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
 
             parts = [unquote(part) for part in path.split("/") if part]
+            if method == "POST" and parts[:2] == ["admin", "checks"] and parts[3:] == ["cancel"]:
+                if not self.server.checks.cancel(parts[2]):
+                    self._send_json({"error": "检测任务不存在或已结束"}, HTTPStatus.NOT_FOUND)
+                    return
+                self._send_json({"ok": True})
+                return
             if method == "DELETE" and len(parts) == 3 and parts[:2] == ["admin", "keys"]:
                 confirm_name = payload.get("confirm_name")
                 if not isinstance(confirm_name, str):

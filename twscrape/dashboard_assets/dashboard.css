@@ -320,6 +320,55 @@ body.login-page {
 
 .sync.is-error { color: var(--red); }
 
+.check-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+
+.check-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.check-status {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.check-panel.is-active .check-status { color: var(--text); }
+
+.check-head .ghost {
+  margin-left: auto;
+  height: 28px;
+  font-size: 12px;
+  padding: 0 9px;
+}
+
+.check-track {
+  height: 4px;
+  border-radius: 4px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.check-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 4px;
+  background: var(--muted);
+  transition: width 0.24s ease;
+}
+
+.check-panel.is-active .check-fill { background: var(--text); }
+
 .search {
   display: flex;
   align-items: center;
@@ -528,6 +577,37 @@ tbody tr.row-revoked:hover { background: transparent; }
 .status-disabled,
 .status-revoked { color: var(--muted); background: #f4f4f5; }
 
+.check-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: #f4f4f5;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.check-badge.is-ok { color: var(--green); background: var(--green-bg); }
+.check-badge.is-bad { color: var(--red); background: var(--red-bg); }
+
+.check-badge.is-running {
+  color: var(--amber);
+  background: var(--amber-bg);
+  animation: check-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes check-pulse {
+  50% { opacity: 0.55; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .check-badge.is-running { animation: none; }
+  .check-fill { transition: none; }
+}
+
 .status-detail {
   color: var(--muted);
   font-size: 12px;
@@ -596,6 +676,11 @@ tbody tr.row-revoked:hover { background: transparent; }
 .row-actions .action-disable,
 .row-actions .action-reset,
 .row-actions .action-revoke {
+  color: var(--muted);
+  background: transparent;
+}
+
+.row-actions .action-check {
   color: var(--muted);
   background: transparent;
 }

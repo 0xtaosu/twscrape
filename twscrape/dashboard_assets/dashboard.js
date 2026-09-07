@@ -2,6 +2,7 @@ const tokenMeta = document.querySelector('meta[name="twscrape-token"]');
 const token = tokenMeta ? tokenMeta.content : "";
 
 const POLL_MS = 10000;
+const CHECK_POLL_MS = 1500;
 const STATUS_LABELS = {
   ready: "可用",
   cooling: "冷却中",
@@ -12,6 +13,7 @@ const STATUS_LABELS = {
 const state = {
   accounts: [],
   summary: null,
+  check: null,
   expanded: null,
   editing: null,
   editingInitialActive: false,
@@ -35,6 +37,11 @@ const els = {
   search: document.querySelector("#searchInput"),
   filter: document.querySelector("#statusFilter"),
   updated: document.querySelector("#updatedAt"),
+  checkAll: document.querySelector("#checkAllButton"),
+  checkPanel: document.querySelector("#checkPanel"),
+  checkStatus: document.querySelector("#checkStatus"),
+  checkFill: document.querySelector("#checkFill"),
+  cancelCheck: document.querySelector("#cancelCheckButton"),
   sessionUser: document.querySelector("#sessionUser"),
   logout: document.querySelector("#logoutButton"),
   addButton: document.querySelector("#addButton"),
@@ -283,6 +290,7 @@ function renderDetailRow(account) {
   );
 
   grid.append(
+    renderCheckCard(account),
     renderDetailCard("各队列请求", queues, "还没有请求记录"),
     lockCard,
     errorCard
@@ -290,6 +298,63 @@ function renderDetailRow(account) {
   td.appendChild(grid);
   tr.appendChild(td);
   return tr;
+}
+
+function checkProbeValue(probe) {
+  const latency = Number(probe.latency_ms);
+  const text =
+    probe.status === "ok"
+      ? probe.detail || "正常"
+      : probe.reason_label || probe.reason || "失败";
+  return Number.isFinite(latency) && latency > 0 ? `${text} · ${latency}ms` : text;
+}
+
+function probeValueClass(probe) {
+  if (probe.status === "ok") return "";
+  // 跳过是"没轮到它"，不是失败，别跟真正的红色错误混在一起
+  return probe.status === "skipped" ? "detail-empty" : "detail-error";
+}
+
+function renderCheckCard(account) {
+  const card = document.createElement("div");
+  card.className = "detail-card";
+  appendText(card, "h3", "检测结果");
+
+  if (account.checking) {
+    appendText(card, "p", "正在检测…", "detail-empty");
+    return card;
+  }
+
+  const check = account.last_check;
+  if (!check) {
+    appendText(card, "p", "还没有检测过", "detail-empty");
+    return card;
+  }
+
+  const probes = Array.isArray(check.probes) ? check.probes : [];
+  if (probes.length) {
+    const list = document.createElement("ul");
+    for (const probe of probes) {
+      const li = document.createElement("li");
+      appendText(li, "span", probe.probe_label || probe.probe);
+      const value = appendText(li, "span", checkProbeValue(probe), probeValueClass(probe));
+      if (probe.detail) value.title = probe.detail;
+      list.appendChild(li);
+    }
+    card.appendChild(list);
+  }
+
+  if (!check.ok && check.detail) {
+    appendText(card, "p", check.detail, "detail-error");
+  }
+  if (check.applied) {
+    appendText(card, "p", "已按检测结果自动停用", "detail-empty");
+  }
+  if (check.finished_at) {
+    const stamp = appendText(card, "p", `检测于 ${relativeTime(check.finished_at)}`, "detail-empty");
+    stamp.title = formatDateTime(check.finished_at);
+  }
+  return card;
 }
 
 function renderProxyCell(account) {
@@ -408,6 +473,19 @@ function renderAccounts() {
       `status status-${statusKey}`
     );
 
+    if (account.checking) {
+      appendText(statusTd, "span", "检测中…", "check-badge is-running");
+    } else if (account.last_check) {
+      const check = account.last_check;
+      const badge = appendText(
+        statusTd,
+        "span",
+        check.ok ? "检测正常" : check.reason_label || "检测失败",
+        `check-badge ${check.ok ? "is-ok" : "is-bad"}`
+      );
+      if (check.detail) badge.title = check.detail;
+    }
+
     const proxyTd = renderProxyCell(account);
 
     const reqTd = labeledCell("总请求", "cell-requests");
@@ -434,6 +512,16 @@ function renderAccounts() {
     }
     toggle.dataset.user = username;
     actions.appendChild(toggle);
+
+    const check = document.createElement("button");
+    check.type = "button";
+    check.dataset.action = "check";
+    check.dataset.user = username;
+    check.className = "action-check";
+    check.textContent = account.checking ? "检测中" : "检测";
+    check.disabled = Boolean(account.checking);
+    check.setAttribute("aria-label", `检测 @${username}`);
+    actions.appendChild(check);
 
     const manage = document.createElement("button");
     manage.type = "button";
@@ -672,11 +760,15 @@ function setSync(text, isError = false) {
   els.updated.classList.toggle("is-error", Boolean(isError));
 }
 
-async function loadAccounts() {
+// 检测中轮询到 1.5s，慢响应会盖住新响应 —— 每轮领一个号，回来发现号过期就丢掉
+let pollSeq = 0;
+
+async function loadAccounts(seq = ++pollSeq) {
   if (!state.accounts.length) state.loading = true;
   setSync("正在刷新");
   try {
     const data = await api("/admin/accounts");
+    if (seq !== pollSeq) return;
     state.accounts = Array.isArray(data.accounts) ? data.accounts : [];
     state.summary = data.summary || null;
     state.loadError = "";
@@ -695,12 +787,115 @@ async function loadAccounts() {
       })}`
     );
   } catch (error) {
+    if (seq !== pollSeq) return;
     state.loadError = error.message || "无法读取账号池";
     state.loading = false;
     renderSummary();
     renderAccounts();
     setSync("刷新失败", true);
     showToast(state.loadError, true);
+  }
+}
+
+function checkIsActive() {
+  const run = state.check;
+  return Boolean(run && (run.state === "queued" || run.state === "running"));
+}
+
+function checkHeadline(run, done, total) {
+  if (run.state === "cancelled") return `已取消 ${done}/${total}`;
+  if (run.state === "done") return `检测完成 ${done}/${total}`;
+  return `检测中 ${done}/${total}`;
+}
+
+function renderCheckPanel() {
+  const run = state.check;
+  if (!run) {
+    els.checkPanel.hidden = true;
+    return;
+  }
+
+  const summary = run.summary || {};
+  const total = Number(summary.total || 0);
+  const done = Number(summary.done || 0);
+  const active = checkIsActive();
+
+  els.checkPanel.hidden = false;
+  els.checkPanel.classList.toggle("is-active", active);
+  els.checkFill.style.width = `${total ? Math.round((done / total) * 100) : 0}%`;
+  els.cancelCheck.hidden = !active;
+  els.checkStatus.textContent = `${checkHeadline(run, done, total)} · 正常 ${Number(
+    summary.ok || 0
+  )} · 异常 ${Number(summary.failed || 0)}`;
+}
+
+async function loadChecks(seq = ++pollSeq) {
+  try {
+    const data = await api("/admin/checks");
+    if (seq !== pollSeq) return;
+    state.check = data.run || null;
+  } catch {
+    // 检测只是辅助信息，读不到就沿用上一次的结果，不打断账号列表
+  }
+  if (seq !== pollSeq) return;
+  renderCheckPanel();
+}
+
+let pollTimer = null;
+
+function scheduleTick() {
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(tick, checkIsActive() ? CHECK_POLL_MS : POLL_MS);
+}
+
+async function tick() {
+  clearTimeout(pollTimer);
+  const seq = ++pollSeq;
+  try {
+    await Promise.all([loadAccounts(seq), loadChecks(seq)]);
+  } finally {
+    scheduleTick();
+  }
+}
+
+async function startCheck(usernames, button) {
+  if (checkIsActive()) {
+    showToast("已有检测在进行中", true);
+    return;
+  }
+  if (button) button.disabled = true;
+  try {
+    const data = await api("/admin/checks", {
+      method: "POST",
+      body: JSON.stringify({ usernames }),
+    });
+    pollSeq += 1; // POST 的结果最新，作废所有在途轮询响应
+    state.check = data.run || null;
+    renderCheckPanel();
+    showToast(`已开始检测 ${Number(state.check?.summary?.total || 0)} 个账号`);
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    if (button) button.disabled = false;
+    await tick();
+  }
+}
+
+async function cancelCheck() {
+  const run = state.check;
+  if (!run) return;
+  els.cancelCheck.disabled = true;
+  try {
+    await api(`/admin/checks/${encodeURIComponent(run.id)}/cancel`, {
+      method: "POST",
+      body: "{}",
+    });
+    showToast("已取消，正在进行的检测会先跑完");
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    els.cancelCheck.disabled = false;
+    await tick();
   }
 }
 
@@ -712,6 +907,10 @@ async function runAccountAction(action, username, button) {
   }
   if (action === "add_cookie") {
     openCookieDialog(username);
+    return;
+  }
+  if (action === "check") {
+    await startCheck([username], button);
     return;
   }
   if (action === "reset") {
@@ -760,6 +959,8 @@ els.filter.addEventListener("change", () => {
   renderAccounts();
 });
 els.addButton.addEventListener("click", () => openCookieDialog());
+els.checkAll.addEventListener("click", () => startCheck("all", els.checkAll));
+els.cancelCheck.addEventListener("click", cancelCheck);
 els.closeDialog.addEventListener("click", closeCookieDialog);
 els.cancelDialog.addEventListener("click", closeCookieDialog);
 els.dialog.addEventListener("close", clearCookieForm);
@@ -975,5 +1176,4 @@ window.addEventListener("pageshow", (event) => {
 
 loadSession();
 renderAccounts();
-loadAccounts();
-setInterval(loadAccounts, POLL_MS);
+tick();
