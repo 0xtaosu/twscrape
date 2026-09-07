@@ -63,6 +63,7 @@ class XClIdGenStore:
 class Ctx:
     def __init__(self, acc: Account, clt: HttpClient, proxy: str | None = None):
         self.req_count = 0
+        self.csrf_resynced = False
         self.acc = acc
         self.clt = clt
         self.proxy = proxy
@@ -273,6 +274,24 @@ class QueueClient:
 
         if has_error(errors, "(32) Could not authenticate you"):
             logger.warning(f"Session expired or banned: {request_log}")
+            await self._close_ctx(-1, inactive=True, msg=err_msg)
+            raise HandledError()
+
+        if has_error(errors, "(353) This request requires a matching csrf cookie and header"):
+            ctx = self.ctx
+            ct0 = ctx.clt.cookies.get("ct0") if ctx is not None else None
+            if (
+                ctx is not None
+                and not ctx.csrf_resynced
+                and ct0
+                and ctx.clt.headers.get("x-csrf-token") != ct0
+            ):
+                ctx.csrf_resynced = True
+                ctx.clt.headers["x-csrf-token"] = ct0
+                logger.warning(f"CSRF token resynced, retrying: {request_log}")
+                raise HandledError()
+
+            logger.warning(f"CSRF cookie mismatch: {request_log}")
             await self._close_ctx(-1, inactive=True, msg=err_msg)
             raise HandledError()
 

@@ -20,6 +20,26 @@ from twscrape.mcp import (
 from twscrape.utils import utc
 
 
+@pytest.mark.parametrize(
+    "origin,token,allowed",
+    [
+        ("https://dashboard.example", "valid", True),
+        ("http://dashboard.example", "valid", True),
+        ("https://attacker.example", "valid", False),
+        ("https://dashboard.example", "invalid", False),
+    ],
+)
+def test_dashboard_mutation_origin_and_token(origin, token, allowed):
+    from types import SimpleNamespace
+
+    from twscrape.dashboard import DashboardHandler
+
+    handler = DashboardHandler.__new__(DashboardHandler)
+    handler.headers = {"Host": "dashboard.example", "Origin": origin, "X-Twscrape-Token": token}
+    handler.server = SimpleNamespace(csrf_token="valid")
+    assert handler._allow_mutation() is allowed
+
+
 async def test_dashboard_snapshot_exposes_only_safe_fields(pool_mock: AccountsPool):
     await pool_mock.add_account_cookies("ready-user", "auth_token=secret; ct0=csrf-secret")
     account = await pool_mock.get("ready-user")

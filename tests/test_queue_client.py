@@ -18,6 +18,49 @@ CF = tuple[AccountsPool, QueueClient, MockClient]
 REAL_XCLID_STORE_GET = XClIdGenStore.get.__func__
 
 
+@pytest.mark.parametrize("repeated", [False, True])
+async def test_csrf_resync_retries_once(client_fixture: CF, repeated):
+    pool, client, mock = client_fixture
+    error = {
+        "errors": [
+            {"code": 353, "message": "This request requires a matching csrf cookie and header"}
+        ]
+    }
+    mock.headers["x-csrf-token"] = "old"
+    mock.cookies["ct0"] = "rotated"
+    mock.add_response(status_code=403, json=error)
+    if repeated:
+        mock.add_response(status_code=403, json=error)
+    mock.add_response(json={"ok": True})
+    async with client:
+        rep = await client.get(URL)
+        assert rep.json() == {"ok": True}
+        assert mock.headers["x-csrf-token"] == "rotated"
+        assert getattr(rep, "__username") == ("user2" if repeated else "user1")
+    assert await get_inactive(pool) == ({"user1"} if repeated else set())
+
+
+@pytest.mark.parametrize("ct0", [None, "same"])
+async def test_csrf_without_resync_rotates(client_fixture: CF, ct0):
+    pool, client, mock = client_fixture
+    mock.headers["x-csrf-token"] = "same"
+    if ct0:
+        mock.cookies["ct0"] = ct0
+    mock.add_response(
+        status_code=403,
+        json={
+            "errors": [
+                {"code": 353, "message": "This request requires a matching csrf cookie and header"}
+            ]
+        },
+    )
+    mock.add_response(json={"ok": True})
+    async with client:
+        rep = await client.get(URL)
+        assert getattr(rep, "__username") == "user2"
+    assert await get_inactive(pool) == {"user1"}
+
+
 async def get_locked(pool: AccountsPool) -> set[str]:
     rep = await pool.get_all()
     return {x.username for x in rep if x.locks.get("SearchTimeline", None) is not None}
