@@ -30,10 +30,6 @@ def _unavailable_user(rep: Any) -> tuple[str, str] | None:
     return message, reason
 
 
-class XApiAuthenticationError(Exception):
-    pass
-
-
 def parse_limit(value: str | None, default: int = 20) -> int:
     if value is None:
         return default
