@@ -21,6 +21,10 @@ from twscrape.xclid import XClIdAccountError
 from .mock_http import MockClient
 
 
+async def _no_sleep(_secs):
+    pass
+
+
 @pytest.fixture
 async def acc_mock(pool_mock: AccountsPool, monkeypatch):
     await pool_mock.add_account_cookies("user1", "auth_token=token1; ct0=csrf1")
@@ -145,6 +149,11 @@ async def test_x_live_probe_detects_cookie_from_another_account(acc_mock):
         (200, {"errors": [{"code": 326, "message": "Denied by access control"}]}, "banned"),
         (429, None, "rate_limited"),
         (200, {"errors": [{"code": 88, "message": "Rate limit exceeded"}]}, "rate_limited"),
+        (
+            200,
+            {"errors": [{"code": 34, "message": "Sorry, that page does not exist"}]},
+            "transaction_id",
+        ),
         (500, None, "error"),
     ],
 )
@@ -155,6 +164,48 @@ async def test_x_live_probe_maps_x_responses(acc_mock, status_code, json_body, e
     result = await check_account(await pool.get("user1"), probes=["x_live"])
     assert result.ok is False
     assert result.reason == expected
+
+
+async def test_x_live_probe_sends_transaction_id(acc_mock):
+    """X 对 settings.json 校验 x-client-transaction-id，裸 clt.get() 会被回 404 + code 34。"""
+    pool, clt = acc_mock
+    clt.add_response(json={"screen_name": "user1"})
+
+    result = await check_account(await pool.get("user1"), probes=["x_live"])
+    assert result.ok is True
+
+    method, url, kwargs = clt.calls[0]
+    assert (method, url) == ("GET", checks.X_LIVE_URL)
+    assert kwargs["headers"]["x-client-transaction-id"] == "mocked-clid"
+
+
+async def test_x_live_404_is_not_blamed_on_the_session(acc_mock, monkeypatch):
+    pool, clt = acc_mock
+    # Ctx.req 会换生成器重试三次，全 404 之后抛 AbortReqError
+    for _ in range(3):
+        clt.add_response(status_code=404, json={"errors": [{"code": 34, "message": "nope"}]})
+    monkeypatch.setattr("twscrape.queue_client.asyncio.sleep", _no_sleep)
+
+    result = await check_account(await pool.get("user1"), probes=["x_live"])
+    assert result.ok is False
+    assert result.reason == "transaction_id"
+    # 证据只说明 transaction-id 这一层坏了，不足以判账号死亡 —— apply 不能停用它
+    assert result.reason not in checks._APPLY_REASONS
+
+
+async def test_apply_leaves_transaction_id_failures_alone(acc_mock, monkeypatch):
+    pool, clt = acc_mock
+    for _ in range(3):
+        clt.add_response(status_code=404, json={})
+    monkeypatch.setattr("twscrape.queue_client.asyncio.sleep", _no_sleep)
+
+    registry = CheckRegistry(pool)
+    run = registry.create(["user1"], probes=["x_live"], apply=True)
+    await registry.execute(run)
+
+    assert run.results["user1"].reason == "transaction_id"
+    assert run.results["user1"].applied is False
+    assert (await pool.get("user1")).active is True
 
 
 async def test_probes_need_a_session(pool_mock: AccountsPool, monkeypatch):
