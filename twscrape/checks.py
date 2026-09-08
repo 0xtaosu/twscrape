@@ -30,7 +30,7 @@ from .api import GQL_FEATURES, GQL_URL, OP_UserByScreenName
 from .http import ConnectError, HttpClient, HttpError, NetworkError, Response, format_error
 from .http import make_client as make_http_client
 from .logger import logger
-from .queue_client import Ctx
+from .queue_client import AbortReqError, Ctx
 from .utils import encode_params, safe_proxy_display, utc
 from .xclid import XClIdAccountError
 
@@ -62,6 +62,7 @@ REASON_LABELS = {
     "probe_failed": "探测服务异常",
     "gql_outdated": "GQL 特性过期",
     "no_data": "没有返回数据",
+    "transaction_id": "transaction-id 失效",
     "error": "未知错误",
 }
 
@@ -267,6 +268,11 @@ def _classify_x(probe: str, rep: Response, latency_ms: int) -> ProbeResult | Non
         return _fail(probe, "rate_limited", message or "触发速率限制", latency_ms)
     if 32 in codes or status in (401, 403):
         return _fail(probe, "session_expired", message or f"HTTP {status}", latency_ms)
+    # X 用 404 + code 34（"Sorry, that page does not exist"）表示 x-client-transaction-id
+    # 不被接受，和"账号挂了"没关系。见 https://github.com/vladkens/twscrape/issues/248
+    if 34 in codes or status == 404:
+        detail = f"X 返回 404，x-client-transaction-id 未被接受（{message or 'code 34'}）"
+        return _fail(probe, "transaction_id", detail, latency_ms)
     if status != 200:
         return _fail(probe, "error", message or f"HTTP {status}", latency_ms)
     if message:
@@ -303,8 +309,13 @@ async def _probe_x_live(acc: Account, clt: HttpClient) -> ProbeResult:
     if not has_required_cookies(acc.cookies):
         return _fail("x_live", "session_missing", "缺少 auth_token / ct0")
 
+    # 必须走 Ctx.req 而不是 clt.get()：X 对这个端点校验 x-client-transaction-id，
+    # 缺了就回 404 + code 34，看起来像"页面不存在"，实际上和会话死活无关。
+    # Ctx.req 负责算这个头、404 时换新的生成器重试，和真实抓取走同一条路。
+    ctx = Ctx(acc, clt, proxy=acc.resolve_proxy())
+
     started = time.monotonic()
-    rep = await clt.get(X_LIVE_URL)
+    rep = await ctx.req("GET", X_LIVE_URL)
     latency = _ms(started)
 
     if failure := _classify_x("x_live", rep, latency):
@@ -376,6 +387,10 @@ async def _run_probe(probe: str, acc: Account, clt: HttpClient, timeout: float) 
     except XClIdAccountError as error:
         # 生成 transaction-id 时拿到的是未登录版 web app —— 会话没了
         return _fail(probe, "session_expired", format_error(error), _ms(started))
+    except AbortReqError as error:
+        # Ctx.req 换了三次生成器还是 404，是 transaction-id 这一层的问题，不赖账号
+        detail = format_error(error) or "x-client-transaction-id 反复被拒"
+        return _fail(probe, "transaction_id", detail, _ms(started))
     except ConnectError as error:
         return _fail(probe, "proxy_unreachable", format_error(error), _ms(started))
     except NetworkError as error:
